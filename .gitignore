@@ -1,0 +1,5 @@
+# Build artifacts (none should normally be committed)
+*.sfs
+*.img
+build/
+*.log

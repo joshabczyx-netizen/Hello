@@ -1,0 +1,65 @@
+#!/bin/bash
+#
+# ramboot - mkinitcpio install hook
+#
+# Pulls everything the runtime hook needs into the initramfs image:
+#   * loop / squashfs / overlay for the RAM-backed overlay root
+#   * dm-crypt plus the full crypto module set for LUKS unlocking
+#   * cryptsetup / dmsetup / losetup / mount / switch_root userspace
+#   * the device-mapper udev rules
+#
+# Modules are forced in (rather than relying on autodetect) so the resulting
+# image boots on hardware other than the build host.
+
+build() {
+    # RAM-overlay stack
+    add_module "loop"
+    add_module "squashfs"
+    add_module "overlay"
+
+    # LUKS / device-mapper
+    add_module "dm-crypt"
+    if [[ -n "${CRYPTO_MODULES}" ]]; then
+        local mod
+        for mod in ${CRYPTO_MODULES}; do
+            add_module "${mod}"
+        done
+    else
+        add_all_modules "/crypto/"
+    fi
+
+    # Userspace
+    add_binary "cryptsetup"
+    add_binary "dmsetup"
+    add_binary "losetup"
+    add_binary "blkid"
+    add_binary "/usr/bin/mount"
+    add_binary "/usr/bin/umount"
+    add_binary "switch_root"
+
+    # device-mapper udev rules (so /dev/mapper/<name> appears)
+    add_file "/usr/lib/udev/rules.d/10-dm.rules"
+    add_file "/usr/lib/udev/rules.d/13-dm-disk.rules"
+    add_file "/usr/lib/udev/rules.d/95-dm-notify.rules"
+    add_file "/usr/lib/initcpio/udev/11-dm-initramfs.rules" \
+             "/usr/lib/udev/rules.d/11-dm-initramfs.rules"
+
+    add_runscript
+}
+
+help() {
+    cat <<'HELPEOF'
+This hook unlocks a LUKS partition, copies a squashfs root image into RAM and
+boots the system from a tmpfs-backed overlay so the running OS lives entirely
+in memory. The backing disk is closed after the copy and may be removed.
+
+Kernel command line:
+  ramboot_dev=UUID=<luks-uuid>   (required) LUKS partition to unlock
+  ramboot_name=<mapper-name>     dm-crypt mapper name          (cryptram)
+  ramboot_img=<path>             squashfs path inside the fs   (/airootfs.sfs)
+  copytoram=yes|no               copy the root image to RAM    (yes)
+  ramboot_cowsize=<size>         writable overlay tmpfs size   (50%)
+HELPEOF
+}
+
+# vim: set ft=sh ts=4 sw=4 et:

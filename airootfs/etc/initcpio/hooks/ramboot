@@ -1,0 +1,117 @@
+#!/usr/bin/ash
+# shellcheck shell=dash
+#
+# ramboot - mkinitcpio runtime hook
+#
+# Boot flow:
+#   1. Resolve the backing block device named by ramboot_dev= on the kernel
+#      command line.
+#   2. If it is a LUKS container, prompt for the passphrase and open it.
+#   3. Mount the (decrypted) filesystem read-only and locate the squashfs
+#      root image (ramboot_img=, default /airootfs.sfs).
+#   4. When copytoram=yes (the default), copy that image into a tmpfs so the
+#      entire OS lives in RAM, then unmount and close the disk - the system
+#      no longer touches storage and the drive may even be removed.
+#   5. Loop-mount the squashfs (read-only "lower") and stack a tmpfs
+#      "upper"/"work" on top with overlayfs, so the live root is writable but
+#      every change is discarded on the next boot.
+#
+# Recognised kernel command-line parameters:
+#   ramboot_dev=UUID=<luks-uuid> | /dev/sdXN   (REQUIRED) backing device
+#   ramboot_name=<mapper-name>                 dm-crypt mapper name  [cryptram]
+#   ramboot_img=<path-in-fs>                   squashfs path         [/airootfs.sfs]
+#   copytoram=yes|no                           copy root to RAM      [yes]
+#   ramboot_cowsize=<size>                     overlay tmpfs size    [50%]
+
+run_hook() {
+    [ -z "${ramboot_name}" ]    && ramboot_name="cryptram"
+    [ -z "${ramboot_img}" ]     && ramboot_img="/airootfs.sfs"
+    [ -z "${copytoram}" ]       && copytoram="yes"
+    [ -z "${ramboot_cowsize}" ] && ramboot_cowsize="50%"
+
+    # Defer the real work to mount_handler, which init() calls with the
+    # new-root mountpoint as $1 (mirrors the archiso hook design).
+    mount_handler="ramboot_mount_handler"
+}
+
+ramboot_mount_handler() {
+    local newroot="$1"
+    local dev cryptdev sfs
+
+    modprobe -a -q loop squashfs overlay dm-crypt >/dev/null 2>&1
+
+    if [ -z "${ramboot_dev}" ]; then
+        err "ramboot: no 'ramboot_dev=' on the kernel command line"
+        launch_interactive_shell
+    fi
+
+    # Wait for the device to appear and resolve UUID=/LABEL=/path forms.
+    dev="$(resolve_device "${ramboot_dev}" "${rootdelay}")"
+    if [ -z "${dev}" ] || [ ! -b "${dev}" ]; then
+        err "ramboot: could not find device '${ramboot_dev}'"
+        launch_interactive_shell
+    fi
+
+    # Unlock LUKS if the device is a crypto container.
+    if cryptsetup isLuks "${dev}" >/dev/null 2>&1; then
+        msg ":: ramboot: unlocking encrypted device ${dev}"
+        until cryptsetup open "${dev}" "${ramboot_name}"; do
+            echo "   Unlock failed - try again."
+        done
+        cryptdev="/dev/mapper/${ramboot_name}"
+    else
+        cryptdev="${dev}"
+    fi
+
+    mkdir -p /ramboot/data
+    if ! mount -o ro "${cryptdev}" /ramboot/data; then
+        err "ramboot: failed to mount ${cryptdev}"
+        launch_interactive_shell
+    fi
+
+    if [ ! -f "/ramboot/data${ramboot_img}" ]; then
+        err "ramboot: root image '${ramboot_img}' not found on device"
+        launch_interactive_shell
+    fi
+
+    if [ "${copytoram}" = "yes" ] || [ "${copytoram}" = "y" ]; then
+        msg ":: ramboot: copying root image into RAM..."
+        mkdir -p /ramboot/img
+        mount -t tmpfs -o "size=100%,mode=0755" ramboot_img /ramboot/img
+        if ! cp "/ramboot/data${ramboot_img}" /ramboot/img/airootfs.sfs; then
+            err "ramboot: copy to RAM failed (not enough memory?)"
+            launch_interactive_shell
+        fi
+        sfs="/ramboot/img/airootfs.sfs"
+
+        # Release the disk entirely - from here on we run purely from RAM.
+        umount /ramboot/data
+        if [ -b "/dev/mapper/${ramboot_name}" ]; then
+            cryptsetup close "${ramboot_name}"
+        fi
+    else
+        sfs="/ramboot/data${ramboot_img}"
+    fi
+
+    # Read-only lower layer from the squashfs.
+    mkdir -p /ramboot/lower
+    if ! mount -t squashfs -o ro "${sfs}" /ramboot/lower; then
+        err "ramboot: failed to mount squashfs image"
+        launch_interactive_shell
+    fi
+
+    # Writable RAM layer (discarded on reboot).
+    mkdir -p /ramboot/cow
+    mount -t tmpfs -o "size=${ramboot_cowsize},mode=0755" ramboot_cow /ramboot/cow
+    mkdir -p /ramboot/cow/upper /ramboot/cow/work
+
+    msg ":: ramboot: assembling overlay root"
+    if ! mount -t overlay airootfs \
+            -o "lowerdir=/ramboot/lower,upperdir=/ramboot/cow/upper,workdir=/ramboot/cow/work" \
+            "${newroot}"; then
+        err "ramboot: failed to assemble overlay root"
+        launch_interactive_shell
+    fi
+}
+
+# vim: set ft=sh ts=4 sw=4 et:
