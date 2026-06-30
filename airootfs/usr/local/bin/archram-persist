@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+#
+# archram-persist - save the in-RAM overlay to the encrypted drive
+#
+# The running system is an overlayfs whose writable "upper" layer lives in a
+# tmpfs (RAM). The 'ramboot' initramfs hook bind-mounts that tmpfs at
+# /var/lib/ramboot/cow, so this tool can snapshot the live upper and write it
+# back onto the LUKS-encrypted data partition as /persist/upper.tar.zst.
+#
+# On the next boot the 'ramboot' hook restores that snapshot into the fresh RAM
+# upper (unless ramboot_persist=no), so your changes come back.
+#
+# Because the system normally runs with copytoram=yes, the drive is closed and
+# may have been removed after boot. Re-insert it before running 'save' - this
+# tool waits for it, re-unlocks LUKS (prompting for the passphrase) and mounts
+# it read-write just long enough to write the snapshot.
+#
+# Usage:
+#   sudo archram-persist save      # snapshot the RAM overlay to the drive
+#   sudo archram-persist status    # show what would be saved / drive info
+#
+set -euo pipefail
+
+COW_DIR="/var/lib/ramboot/cow"
+UPPER="${COW_DIR}/upper"
+PERSIST_REL="persist/upper.tar.zst"     # path on the data filesystem
+SAVE_MAPPER="ramboot_save"              # temporary dm-crypt name for saving
+
+c_red=$'\e[31m'; c_grn=$'\e[32m'; c_ylw=$'\e[33m'; c_blu=$'\e[34m'; c_rst=$'\e[0m'
+msg()  { printf '%s::%s %s\n' "${c_blu}" "${c_rst}" "$*"; }
+ok()   { printf '%s::%s %s\n' "${c_grn}" "${c_rst}" "$*"; }
+warn() { printf '%s::%s %s\n' "${c_ylw}" "${c_rst}" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "${c_red}" "${c_rst}" "$*" >&2; exit 1; }
+
+# --- parse the kernel command line written by archram-install ---------------
+RAMBOOT_DEV=""; COPYTORAM="yes"; PERSIST="auto"
+parse_cmdline() {
+    local tok
+    for tok in $(cat /proc/cmdline); do
+        case "${tok}" in
+            ramboot_dev=*)     RAMBOOT_DEV="${tok#ramboot_dev=}" ;;
+            copytoram=*)       COPYTORAM="${tok#copytoram=}" ;;
+            ramboot_persist=*) PERSIST="${tok#ramboot_persist=}" ;;
+        esac
+    done
+    [[ -n "${RAMBOOT_DEV}" ]] || die "no ramboot_dev= on the kernel command line - not a ramboot system?"
+}
+
+# Resolve the backing device path, waiting for the drive to be (re)inserted.
+resolve_devpath() {
+    local target
+    if [[ "${RAMBOOT_DEV}" == UUID=* ]]; then
+        target="/dev/disk/by-uuid/${RAMBOOT_DEV#UUID=}"
+    else
+        target="${RAMBOOT_DEV}"
+    fi
+    if [[ ! -e "${target}" ]]; then
+        warn "Drive ${RAMBOOT_DEV} not present - insert it now."
+        local i
+        for ((i = 0; i < 120; i++)); do
+            [[ -e "${target}" ]] && break
+            sleep 1
+        done
+    fi
+    [[ -e "${target}" ]] || die "drive ${RAMBOOT_DEV} did not appear"
+    printf '%s' "$(readlink -f "${target}")"
+}
+
+require_root()  { [[ ${EUID} -eq 0 ]] || die "must run as root (try: sudo $0 $*)"; }
+require_upper() {
+    mountpoint -q "${COW_DIR}" || \
+        die "overlay cow not mounted at ${COW_DIR} - this is not a ramboot system, or the hook did not bind it."
+    [[ -d "${UPPER}" ]] || die "overlay upper directory missing (${UPPER})"
+}
+
+cmd_status() {
+    parse_cmdline
+    require_upper
+    echo "Backing device : ${RAMBOOT_DEV}"
+    echo "copytoram      : ${COPYTORAM}"
+    echo "persist mode   : ${PERSIST}"
+    echo "overlay upper  : ${UPPER}"
+    echo -n "changed files  : "; find "${UPPER}" -mindepth 1 2>/dev/null | wc -l
+    echo -n "upper size     : "; du -sh "${UPPER}" 2>/dev/null | cut -f1
+}
+
+cmd_save() {
+    require_root "save"
+    parse_cmdline
+    require_upper
+
+    if [[ "${COPYTORAM}" != "yes" && "${COPYTORAM}" != "y" ]]; then
+        die "persistence save requires copytoram=yes (the drive is in use when copytoram=no)."
+    fi
+
+    local devpath; devpath="$(resolve_devpath)"
+    msg "Using drive ${devpath} (${RAMBOOT_DEV})"
+
+    # Clean up any stale temporary mapping from a previous run.
+    cryptsetup status "${SAVE_MAPPER}" >/dev/null 2>&1 && cryptsetup close "${SAVE_MAPPER}"
+
+    local mnt; mnt="$(mktemp -d)"
+    cleanup() {
+        set +e
+        mountpoint -q "${mnt}" && umount "${mnt}"
+        rmdir "${mnt}" 2>/dev/null
+        cryptsetup status "${SAVE_MAPPER}" >/dev/null 2>&1 && cryptsetup close "${SAVE_MAPPER}"
+    }
+    trap cleanup EXIT
+
+    msg "Unlocking ${devpath}..."
+    cryptsetup open "${devpath}" "${SAVE_MAPPER}"
+
+    msg "Mounting data filesystem read-write..."
+    mount "/dev/mapper/${SAVE_MAPPER}" "${mnt}"
+    mkdir -p "${mnt}/persist"
+
+    local dest="${mnt}/${PERSIST_REL}"
+    local tmp="${dest}.new"
+
+    msg "Snapshotting overlay upper (${UPPER}) -> ${PERSIST_REL}..."
+    sync
+    # Preserve overlay whiteouts (device nodes), ACLs and trusted.* xattrs so a
+    # restore reproduces deletions/opaque dirs exactly.
+    tar -c --zstd --acls --xattrs --xattrs-include='*' --numeric-owner \
+        -f "${tmp}" -C "${UPPER}" . || die "snapshot failed"
+
+    # Atomic replace, keeping one backup.
+    [[ -f "${dest}" ]] && mv -f "${dest}" "${dest}.bak"
+    mv -f "${tmp}" "${dest}"
+    sync
+
+    local size; size="$(du -h "${dest}" | cut -f1)"
+    ok "Saved snapshot (${size}). It will be restored on the next boot."
+}
+
+main() {
+    local sub="${1:-}"
+    case "${sub}" in
+        save)        shift; cmd_save "$@" ;;
+        status)      shift; cmd_status "$@" ;;
+        ""|-h|--help)
+            cat <<EOF
+archram-persist - save the in-RAM overlay to the encrypted drive
+
+Usage:
+  sudo archram-persist save      Snapshot the RAM overlay to the drive.
+                                 Re-insert the drive first if it was removed;
+                                 you will be prompted for the LUKS passphrase.
+  archram-persist status         Show drive info and how much would be saved.
+
+The snapshot is restored automatically on the next boot (kernel parameter
+ramboot_persist=auto|yes). Pass ramboot_persist=no to ignore it.
+EOF
+            ;;
+        *) die "unknown subcommand '${sub}' (try: save | status)" ;;
+    esac
+}
+
+main "$@"

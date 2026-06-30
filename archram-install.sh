@@ -49,6 +49,7 @@ ESP_SIZE="${ESP_SIZE:-1GiB}"
 SQUASH_COMP="${SQUASH_COMP:-zstd}"
 COW_SIZE="${COW_SIZE:-50%}"
 DATA_FS="${DATA_FS:-f2fs}"            # filesystem holding the squashfs image
+PERSIST="${PERSIST:-auto}"           # auto|yes|no - restore saved overlay at boot
 EXTRA_PACKAGES="${EXTRA_PACKAGES:-}"
 ASSUME_YES="${ASSUME_YES:-0}"
 
@@ -59,8 +60,10 @@ SB_MICROSOFT="${SB_MICROSOFT:-1}"    # 1 = also enroll Microsoft vendor certs
 # SB_KEYDIR=/path/to/keystore        # optional persistent sbctl keystore
 
 ROOT_IMG_NAME="airootfs.sfs"          # squashfs filename inside the LUKS fs
+# tar + zstd power 'archram-persist'; f2fs-tools lets the running system fsck
+# the data partition.
 BASE_PACKAGES="base linux linux-firmware mkinitcpio cryptsetup \
-sudo networkmanager nano vim openssh terminus-font"
+sudo networkmanager nano vim openssh terminus-font tar zstd f2fs-tools"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKEL_DIR="${SCRIPT_DIR}/airootfs"
@@ -222,10 +225,11 @@ build_rootfs() {
         pacstrap "${BUILD_DIR}" "${ucode}" || warn "microcode install failed - continuing."
     fi
 
-    msg "Installing the ramboot hook and mkinitcpio drop-in..."
+    msg "Installing the ramboot hook, mkinitcpio drop-in and persist tool..."
     cp -a "${SKEL_DIR}/." "${BUILD_DIR}/"
     chmod 0755 "${BUILD_DIR}/etc/initcpio/hooks/ramboot" \
-               "${BUILD_DIR}/etc/initcpio/install/ramboot"
+               "${BUILD_DIR}/etc/initcpio/install/ramboot" \
+               "${BUILD_DIR}/usr/local/bin/archram-persist"
 
     # Minimal fstab: the root is an overlay assembled by the initramfs, so
     # there is nothing for systemd to mount from disk.
@@ -386,10 +390,13 @@ EOF
 title   Arch Linux (RAM / LUKS)
 linux   /vmlinuz-linux
 ${ucode_line}initrd  /initramfs-linux.img
-options ramboot_dev=UUID=${LUKS_UUID} ramboot_name=${MAPPER} ramboot_img=/${ROOT_IMG_NAME} copytoram=yes ramboot_cowsize=${COW_SIZE} rw
+options ramboot_dev=UUID=${LUKS_UUID} ramboot_name=${MAPPER} ramboot_img=/${ROOT_IMG_NAME} copytoram=yes ramboot_cowsize=${COW_SIZE} ramboot_persist=${PERSIST} rw
 EOF
 
     setup_secureboot
+
+    # Persistence snapshot directory (archram-persist writes here at runtime).
+    mkdir -p "${DATA_MNT}/persist"
 
     msg "Packing root filesystem into squashfs (${SQUASH_COMP})..."
     # /boot lives on the ESP already; exclude it from the image.

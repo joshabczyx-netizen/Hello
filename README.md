@@ -16,7 +16,10 @@ lives on an internal drive.
 | ---------------- | --------------------- | --------- | ---------------------- |
 | Kernel + initramfs | EFI System Partition | no¹      | yes                    |
 | Root image (`.sfs`) | LUKS2 → f2fs        | **yes**   | yes (read-only)        |
-| Running root     | RAM (tmpfs overlay)   | n/a       | **no — wiped on reboot** |
+| Running root     | RAM (tmpfs overlay)   | n/a       | **no — wiped on reboot**² |
+
+² …unless you explicitly snapshot it with `archram-persist save`; see
+[Persistence](#persistence).
 
 ¹ UEFI cannot read LUKS, so the bootloader/kernel/initramfs must sit on an
 unencrypted ESP. Only the OS image itself is encrypted. The bootloader and
@@ -44,8 +47,11 @@ with `DATA_FS=ext4` if you prefer.
 3. The squashfs image is **copied into a tmpfs** (`copytoram=yes`).
 4. The disk is **unmounted and the LUKS mapping closed** — from here nothing
    touches storage; the drive can even be physically removed.
-5. An **overlayfs** is assembled: read-only squashfs (lower) + tmpfs (upper).
-6. `switch_root` hands off to the in-RAM system.
+5. If a persistence snapshot exists (and `ramboot_persist!=no`), it is
+   **restored into the fresh tmpfs upper** before the overlay is assembled.
+6. An **overlayfs** is assembled: read-only squashfs (lower) + tmpfs (upper).
+7. The cow tmpfs is bind-mounted at `/var/lib/ramboot/cow` so it can be
+   snapshotted later, then `switch_root` hands off to the in-RAM system.
 
 ## Requirements
 
@@ -99,6 +105,7 @@ sudo TARGET_DISK=/dev/nvme0n1 \
 | `ESP_SIZE`        | `1GiB`         | EFI partition size                                 |
 | `SQUASH_COMP`     | `zstd`         | `mksquashfs` compressor (`zstd`, `xz`, `gzip`, …)  |
 | `COW_SIZE`        | `50%`          | Writable overlay tmpfs size cap at runtime         |
+| `PERSIST`         | `auto`         | Restore a saved overlay at boot (`auto`/`yes`/`no`)|
 | `EXTRA_PACKAGES`  | *(empty)*      | Extra pacman packages, space separated             |
 | `LUKS_PASSPHRASE` | *(prompted)*   | Disk encryption passphrase                         |
 | `ROOT_PASSWORD`   | *(prompted)*   | Root account password                              |
@@ -147,11 +154,13 @@ media (e.g. a USB stick): `SB_KEYDIR=/run/media/usb/sbkeys ./archram-install.sh`
 ```
 archram-install.sh                         # the installer (run from the live ISO)
 airootfs/                                  # skeleton copied into the new root
-└─ etc/
-   ├─ initcpio/
-   │  ├─ hooks/ramboot                     # runtime hook: unlock, copy-to-RAM, overlay
-   │  └─ install/ramboot                   # build hook: pulls modules/binaries in
-   └─ mkinitcpio.conf.d/ramboot.conf       # HOOKS/MODULES/compression for the image
+├─ etc/
+│  ├─ initcpio/
+│  │  ├─ hooks/ramboot                     # runtime hook: unlock, restore, copy-to-RAM, overlay
+│  │  └─ install/ramboot                   # build hook: pulls modules/binaries in
+│  └─ mkinitcpio.conf.d/ramboot.conf       # HOOKS/MODULES/compression for the image
+├─ usr/local/bin/archram-persist           # snapshot the RAM overlay back to the drive
+└─ var/lib/ramboot/cow/                     # bind-mount point for the live cow tmpfs
 ```
 
 ## The `ramboot` hook
@@ -166,11 +175,48 @@ installer in `loader/entries/archram.conf`):
 | `ramboot_img=`    | `/airootfs.sfs`  | squashfs path inside the partition       |
 | `copytoram=`      | `yes`            | `no` keeps the squashfs on disk (loop)   |
 | `ramboot_cowsize=`| `50%`            | writable overlay tmpfs size cap          |
+| `ramboot_persist=`| `auto`           | restore saved upper (`auto`/`yes`/`no`)  |
 
 By default the initramfs is built **without `autodetect`** so the image is
 portable across machines. If you only ever boot on the build host and want a
 smaller initramfs, add `autodetect` after `base udev` in
 `airootfs/etc/mkinitcpio.conf.d/ramboot.conf`.
+
+## Persistence
+
+The system is amnesiac by default — every change lives in the RAM overlay and
+is gone on reboot. When you *do* want to keep what you changed, snapshot the RAM
+overlay back onto the encrypted drive with the bundled **`archram-persist`**
+tool. On the next boot the `ramboot` hook restores that snapshot into the fresh
+RAM overlay (controlled by `ramboot_persist=`, default `auto`).
+
+How it works:
+
+- The initramfs bind-mounts the writable overlay layer (the tmpfs `upper`) into
+  the running system at `/var/lib/ramboot/cow`, so it stays reachable after
+  `switch_root`.
+- `archram-persist save` archives that `upper` (preserving overlay whiteouts,
+  ACLs and `trusted.*` xattrs, so deletions are reproduced) into
+  `/persist/upper.tar.zst` on the LUKS-encrypted f2fs partition.
+- Because the default `copytoram=yes` releases the disk at boot, the drive may
+  have been removed. **Re-insert it before saving** — the tool waits for the
+  drive, re-unlocks LUKS (prompting for the passphrase), mounts it read-write
+  just long enough to write the snapshot, then closes it again.
+
+```bash
+# After making changes in the running system, re-insert the drive and:
+sudo archram-persist save        # snapshot RAM overlay -> drive (encrypted)
+archram-persist status           # show drive info and how much would be saved
+```
+
+The snapshot is encrypted at rest (it lives inside the LUKS container) and one
+previous snapshot is kept as `upper.tar.zst.bak`. To boot amnesiac for one
+session, edit the boot entry and set `ramboot_persist=no`; to disable restore
+permanently, install with `PERSIST=no`.
+
+> Snapshot save is supported with `copytoram=yes` (the default). With
+> `copytoram=no` the drive stays mounted for the running system, so it can't be
+> re-mounted read-write for the snapshot.
 
 ## Updating the installed system
 

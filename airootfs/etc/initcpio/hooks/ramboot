@@ -9,12 +9,17 @@
 #   2. If it is a LUKS container, prompt for the passphrase and open it.
 #   3. Mount the (decrypted) filesystem read-only and locate the squashfs
 #      root image (ramboot_img=, default /airootfs.sfs).
-#   4. When copytoram=yes (the default), copy that image into a tmpfs so the
-#      entire OS lives in RAM, then unmount and close the disk - the system
-#      no longer touches storage and the drive may even be removed.
-#   5. Loop-mount the squashfs (read-only "lower") and stack a tmpfs
-#      "upper"/"work" on top with overlayfs, so the live root is writable but
-#      every change is discarded on the next boot.
+#   4. Create the writable tmpfs ("upper"/"work") and, if a persistence
+#      snapshot exists and ramboot_persist!=no, restore it into the upper so
+#      previously-saved changes come back. This MUST happen before the overlay
+#      is assembled - poking a live overlay's upperdir is unsafe.
+#   5. When copytoram=yes (the default), copy the squashfs into a tmpfs so the
+#      entire OS lives in RAM, then unmount and close the disk - the system no
+#      longer touches storage and the drive may even be removed.
+#   6. Loop-mount the squashfs (read-only "lower") and stack the tmpfs upper on
+#      top with overlayfs.
+#   7. Bind-mount the cow tmpfs into the new root at /var/lib/ramboot/cow so the
+#      'archram-persist' tool can snapshot the live upper back to the drive.
 #
 # Recognised kernel command-line parameters:
 #   ramboot_dev=UUID=<luks-uuid> | /dev/sdXN   (REQUIRED) backing device
@@ -22,12 +27,18 @@
 #   ramboot_img=<path-in-fs>                   squashfs path         [/airootfs.sfs]
 #   copytoram=yes|no                           copy root to RAM      [yes]
 #   ramboot_cowsize=<size>                     overlay tmpfs size    [50%]
+#   ramboot_persist=auto|yes|no                restore saved upper   [auto]
+#                                              (auto = restore if a snapshot
+#                                               is present; yes = warn if not)
+
+PERSIST_PATH="/persist/upper.tar.zst"   # snapshot location on the data fs
 
 run_hook() {
     [ -z "${ramboot_name}" ]    && ramboot_name="cryptram"
     [ -z "${ramboot_img}" ]     && ramboot_img="/airootfs.sfs"
     [ -z "${copytoram}" ]       && copytoram="yes"
     [ -z "${ramboot_cowsize}" ] && ramboot_cowsize="50%"
+    [ -z "${ramboot_persist}" ] && ramboot_persist="auto"
 
     # Defer the real work to mount_handler, which init() calls with the
     # new-root mountpoint as $1 (mirrors the archiso hook design).
@@ -77,6 +88,25 @@ ramboot_mount_handler() {
         launch_interactive_shell
     fi
 
+    # Writable RAM layer (discarded on reboot unless a snapshot is saved).
+    mkdir -p /ramboot/cow
+    mount -t tmpfs -o "size=${ramboot_cowsize},mode=0755" ramboot_cow /ramboot/cow
+    mkdir -p /ramboot/cow/upper /ramboot/cow/work
+
+    # Restore a persistence snapshot into the upper, if requested/available.
+    if [ "${ramboot_persist}" != "no" ]; then
+        if [ -f "/ramboot/data${PERSIST_PATH}" ]; then
+            msg ":: ramboot: restoring saved overlay snapshot..."
+            if ! tar -x --zstd --acls --xattrs --xattrs-include='*' \
+                    --numeric-owner -p -f "/ramboot/data${PERSIST_PATH}" \
+                    -C /ramboot/cow/upper; then
+                err "ramboot: snapshot restore failed - continuing without it"
+            fi
+        elif [ "${ramboot_persist}" = "yes" ]; then
+            msg ":: ramboot: no saved snapshot found (${PERSIST_PATH})"
+        fi
+    fi
+
     if [ "${copytoram}" = "yes" ] || [ "${copytoram}" = "y" ]; then
         msg ":: ramboot: copying root image into RAM..."
         mkdir -p /ramboot/img
@@ -103,17 +133,20 @@ ramboot_mount_handler() {
         launch_interactive_shell
     fi
 
-    # Writable RAM layer (discarded on reboot).
-    mkdir -p /ramboot/cow
-    mount -t tmpfs -o "size=${ramboot_cowsize},mode=0755" ramboot_cow /ramboot/cow
-    mkdir -p /ramboot/cow/upper /ramboot/cow/work
-
     msg ":: ramboot: assembling overlay root"
     if ! mount -t overlay airootfs \
             -o "lowerdir=/ramboot/lower,upperdir=/ramboot/cow/upper,workdir=/ramboot/cow/work" \
             "${newroot}"; then
         err "ramboot: failed to assemble overlay root"
         launch_interactive_shell
+    fi
+
+    # Expose the cow tmpfs inside the new root so 'archram-persist' can read the
+    # live overlay upper after switch_root. /var/lib/ramboot/cow is used (not
+    # /run, which systemd replaces with a fresh tmpfs at boot). The mountpoint
+    # ships in the squashfs.
+    if [ -d "${newroot}/var/lib/ramboot/cow" ]; then
+        mount --bind /ramboot/cow "${newroot}/var/lib/ramboot/cow"
     fi
 }
 
