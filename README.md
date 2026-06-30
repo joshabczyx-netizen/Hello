@@ -15,26 +15,32 @@ lives on an internal drive.
 | Layer            | Where it lives        | Encrypted | Persists across reboot |
 | ---------------- | --------------------- | --------- | ---------------------- |
 | Kernel + initramfs | EFI System Partition | no¹      | yes                    |
-| Root image (`.sfs`) | LUKS2 partition      | **yes**   | yes (read-only)        |
+| Root image (`.sfs`) | LUKS2 → f2fs        | **yes**   | yes (read-only)        |
 | Running root     | RAM (tmpfs overlay)   | n/a       | **no — wiped on reboot** |
 
 ¹ UEFI cannot read LUKS, so the bootloader/kernel/initramfs must sit on an
-unencrypted ESP. Only the OS image itself is encrypted. See
-[Security notes](#security-notes).
+unencrypted ESP. Only the OS image itself is encrypted. The bootloader and
+kernel are **Secure Boot signed** so the firmware refuses tampered binaries —
+see [Secure Boot](#secure-boot) and [Security notes](#security-notes).
 
 ## Disk layout
 
 ```
 /dev/<disk>
-├─ part1  ESP    FAT32   (default 1 GiB)  →  /vmlinuz-linux, /initramfs-linux.img, systemd-boot
-└─ part2  LUKS2  ext4    (rest of disk)   →  /airootfs.sfs   (squashfs root image)
+├─ part1  ESP    FAT32   (default 1 GiB)  →  /vmlinuz-linux, /initramfs-linux.img, systemd-boot (signed)
+└─ part2  LUKS2  f2fs    (rest of disk)   →  /airootfs.sfs   (squashfs root image)
 ```
+
+The filesystem inside the LUKS container is **f2fs** by default (flash-friendly,
+well suited to the SSD/USB media this kind of image usually lives on). Override
+with `DATA_FS=ext4` if you prefer.
 
 ## Boot flow
 
-1. `systemd-boot` (on the ESP) loads the kernel + initramfs.
-2. The `ramboot` initramfs hook prompts for the LUKS passphrase and unlocks the
-   partition.
+1. The firmware verifies and runs the Secure Boot–signed `systemd-boot`, which
+   loads the signed kernel + initramfs from the ESP.
+2. The `ramboot` initramfs hook prompts for the LUKS passphrase, unlocks the
+   partition and mounts the f2fs filesystem.
 3. The squashfs image is **copied into a tmpfs** (`copytoram=yes`).
 4. The disk is **unmounted and the LUKS mapping closed** — from here nothing
    touches storage; the drive can even be physically removed.
@@ -48,6 +54,11 @@ unencrypted ESP. Only the OS image itself is encrypted. See
 - Enough RAM: at runtime you need roughly **`squashfs size` + working set**. A
   minimal base image is ~400–600 MB, so 2 GB RAM is a comfortable floor; add
   more for desktops or large `EXTRA_PACKAGES`.
+- For Secure Boot **key enrollment**, the firmware must be in **Setup Mode**
+  (clear/erase the existing Secure Boot keys in your firmware setup screen
+  first). Without Setup Mode the installer still creates keys and signs the
+  boot chain, but you must enroll the keys yourself later. See
+  [Secure Boot](#secure-boot).
 
 ## Usage
 
@@ -84,6 +95,7 @@ sudo TARGET_DISK=/dev/nvme0n1 \
 | `LOCALE`          | `en_US.UTF-8`  | Locale to generate and use                         |
 | `KEYMAP`          | `us`           | Console keymap (also used at the passphrase prompt)|
 | `MAPPER`          | `cryptram`     | dm-crypt mapper name                               |
+| `DATA_FS`         | `f2fs`         | Filesystem in the LUKS container (`f2fs` or `ext4`)|
 | `ESP_SIZE`        | `1GiB`         | EFI partition size                                 |
 | `SQUASH_COMP`     | `zstd`         | `mksquashfs` compressor (`zstd`, `xz`, `gzip`, …)  |
 | `COW_SIZE`        | `50%`          | Writable overlay tmpfs size cap at runtime         |
@@ -92,6 +104,43 @@ sudo TARGET_DISK=/dev/nvme0n1 \
 | `ROOT_PASSWORD`   | *(prompted)*   | Root account password                              |
 | `USER_PASSWORD`   | *(root's)*     | Password for `USERNAME_`                            |
 | `ASSUME_YES`      | `0`            | `1` skips the destructive-wipe confirmation        |
+| `SECUREBOOT`      | `1`            | `1` create keys, (maybe) enroll, sign boot chain   |
+| `SB_ENROLL`       | `auto`         | `auto`/`yes`/`no` — enroll keys into firmware      |
+| `SB_MICROSOFT`    | `1`            | `1` also enroll Microsoft vendor certs (`-m`)      |
+| `SB_KEYDIR`       | *(unset)*      | Persistent sbctl keystore to reuse across installs |
+
+## Secure Boot
+
+The installer uses [`sbctl`](https://github.com/Foxboron/sbctl) to:
+
+1. **Create** your own Secure Boot keys (Platform Key, KEK, db).
+2. **Enroll** them into the firmware — only when the firmware is in **Setup
+   Mode** (`SB_ENROLL=auto`), or unconditionally with `SB_ENROLL=yes`. The
+   Microsoft vendor certificates are enrolled too (`SB_MICROSOFT=1`) so
+   firmware/option-ROMs signed by Microsoft keep working.
+3. **Sign** the bootloader (`systemd-bootx64.efi`, `BOOTX64.EFI`) and the
+   kernel (`vmlinuz-linux`). With Secure Boot enabled the firmware then refuses
+   to run any unsigned/tampered bootloader or kernel.
+
+Put the firmware in **Setup Mode** before installing (clear the existing keys in
+your firmware's Secure Boot menu), then enable Secure Boot afterwards. If you
+skip Setup Mode, keys are still created and the chain is signed; enroll later
+from a running system or the firmware:
+
+```bash
+sbctl enroll-keys --microsoft   # requires Setup Mode
+```
+
+Reuse the same keys across re-installs by pointing `SB_KEYDIR` at persistent
+media (e.g. a USB stick): `SB_KEYDIR=/run/media/usb/sbkeys ./archram-install.sh`.
+
+> **Initramfs caveat.** Secure Boot validates the bootloader and kernel, but the
+> **separate initramfs is not signature-checked** — an attacker who can write to
+> the ESP could swap it and capture your LUKS passphrase. To close this gap,
+> build a **Unified Kernel Image** (kernel + initramfs + cmdline in one signed
+> EFI binary) via mkinitcpio's UKI preset and sign that instead. This installer
+> ships the standard signed-bootloader-and-kernel setup; UKI is a documented
+> hardening step on top.
 
 ## Repository layout
 
@@ -136,11 +185,14 @@ the ESP kernel/initramfs if the kernel changed.
 
 ## Security notes
 
-- **The ESP is not encrypted.** The kernel and initramfs are exposed; an
-  attacker with physical access could tamper with them (an "evil maid"
-  attack). For stronger guarantees, enable **UEFI Secure Boot** and sign the
-  boot files, or use a **Unified Kernel Image** with measured boot / TPM
-  sealing. This installer does not set that up.
+- **The ESP is not encrypted**, but the bootloader and kernel are **Secure Boot
+  signed**, so the firmware rejects tampered binaries (mitigating "evil maid"
+  attacks on those files). The **initramfs is still not covered** by Secure
+  Boot — see the [Secure Boot](#secure-boot) UKI caveat for full coverage and
+  optional TPM measured-boot sealing.
+- Secure Boot only protects you once it is **enabled in firmware with your keys
+  enrolled**. Putting the firmware in Setup Mode and re-enabling Secure Boot is a
+  manual step (see [Secure Boot](#secure-boot)).
 - The LUKS passphrase is read into a shell variable during install. Prefer the
   interactive prompt over `LUKS_PASSPHRASE=` in your shell history/environment.
 - The amnesiac design means **no logs, keys, or files written at runtime

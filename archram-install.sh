@@ -48,8 +48,15 @@ MAPPER="${MAPPER:-cryptram}"
 ESP_SIZE="${ESP_SIZE:-1GiB}"
 SQUASH_COMP="${SQUASH_COMP:-zstd}"
 COW_SIZE="${COW_SIZE:-50%}"
+DATA_FS="${DATA_FS:-f2fs}"            # filesystem holding the squashfs image
 EXTRA_PACKAGES="${EXTRA_PACKAGES:-}"
 ASSUME_YES="${ASSUME_YES:-0}"
+
+# Secure Boot (sbctl)
+SECUREBOOT="${SECUREBOOT:-1}"        # 1 = create keys, (maybe) enroll, sign
+SB_ENROLL="${SB_ENROLL:-auto}"       # auto|yes|no - enroll keys into firmware
+SB_MICROSOFT="${SB_MICROSOFT:-1}"    # 1 = also enroll Microsoft vendor certs
+# SB_KEYDIR=/path/to/keystore        # optional persistent sbctl keystore
 
 ROOT_IMG_NAME="airootfs.sfs"          # squashfs filename inside the LUKS fs
 BASE_PACKAGES="base linux linux-firmware mkinitcpio cryptsetup \
@@ -117,14 +124,16 @@ preflight() {
         die "Cannot find the 'airootfs' skeleton next to this script (${SKEL_DIR})."
 
     msg "Ensuring required tools are present on the live system..."
-    local need=(pacstrap arch-chroot mksquashfs cryptsetup sgdisk mkfs.fat bootctl blkid)
+    local need=(pacstrap arch-chroot mksquashfs cryptsetup sgdisk mkfs.fat "mkfs.${DATA_FS}" bootctl blkid)
+    [[ "${SECUREBOOT}" == "1" ]] && need+=(sbctl)
     local missing=()
     local t
     for t in "${need[@]}"; do command -v "${t}" >/dev/null 2>&1 || missing+=("${t}"); done
     if ((${#missing[@]})); then
         warn "Missing: ${missing[*]} - installing toolchain via pacman..."
         pacman -Sy --needed --noconfirm \
-            arch-install-scripts squashfs-tools gptfdisk dosfstools cryptsetup systemd
+            arch-install-scripts squashfs-tools gptfdisk dosfstools cryptsetup \
+            f2fs-tools sbctl systemd
     fi
     for t in "${need[@]}"; do
         command -v "${t}" >/dev/null 2>&1 || die "Still missing required tool: ${t}"
@@ -183,8 +192,12 @@ partition_and_encrypt() {
     printf '%s' "${LUKS_PASSPHRASE}" | \
         cryptsetup open "${LUKS_PART}" "${MAPPER}" -
 
-    msg "Creating ext4 filesystem inside the encrypted container..."
-    mkfs.ext4 -q -L cryptroot "/dev/mapper/${MAPPER}"
+    msg "Creating ${DATA_FS} filesystem inside the encrypted container..."
+    case "${DATA_FS}" in
+        f2fs) mkfs.f2fs -f -l cryptroot "/dev/mapper/${MAPPER}" >/dev/null ;;
+        ext4) mkfs.ext4 -q -L cryptroot "/dev/mapper/${MAPPER}" ;;
+        *)    "mkfs.${DATA_FS}" "/dev/mapper/${MAPPER}" ;;
+    esac
 
     LUKS_UUID="$(blkid -s UUID -o value "${LUKS_PART}")"
     [[ -n "${LUKS_UUID}" ]] || die "Could not read LUKS UUID."
@@ -260,6 +273,82 @@ CHROOT
 }
 
 # --------------------------------------------------------------------------- #
+# Secure Boot (sbctl): create keys, optionally enroll, sign the boot chain.
+#
+# Firmware must be in "Setup Mode" (clear the existing Secure Boot keys in the
+# firmware setup screen) for enrollment to succeed. The bootloader and kernel
+# are signed; the separate initramfs is NOT covered by Secure Boot - see the
+# README's UKI note to close that gap.
+# --------------------------------------------------------------------------- #
+setup_secureboot() {
+    if [[ "${SECUREBOOT}" != "1" ]]; then
+        warn "Secure Boot signing disabled (SECUREBOOT=0)."
+        return 0
+    fi
+    command -v sbctl >/dev/null 2>&1 || die "SECUREBOOT=1 but sbctl is not available."
+
+    msg "Configuring Secure Boot (sbctl)..."
+
+    # Restore a persistent keystore, if one was provided.
+    if [[ -n "${SB_KEYDIR:-}" ]] && compgen -G "${SB_KEYDIR}/keys/*" >/dev/null 2>&1; then
+        msg "Restoring Secure Boot keys from ${SB_KEYDIR}..."
+        mkdir -p /var/lib/sbctl
+        cp -a "${SB_KEYDIR}/." /var/lib/sbctl/
+    fi
+
+    # Create platform keys only if none exist yet.
+    if compgen -G "/var/lib/sbctl/keys/*" >/dev/null 2>&1 || \
+       compgen -G "/usr/share/secureboot/keys/*" >/dev/null 2>&1; then
+        msg "Reusing existing Secure Boot keys."
+    else
+        msg "Creating Secure Boot keys..."
+        sbctl create-keys
+    fi
+
+    # Enroll into firmware only when it is safe/possible to do so.
+    local in_setup="no"
+    if sbctl status --json >/tmp/sbstatus.json 2>/dev/null; then
+        grep -q '"setup_mode":true' /tmp/sbstatus.json && in_setup="yes"
+    fi
+    local do_enroll=0
+    case "${SB_ENROLL}" in
+        yes)    do_enroll=1 ;;
+        no)     do_enroll=0 ;;
+        auto|*) [[ "${in_setup}" == "yes" ]] && do_enroll=1 ;;
+    esac
+
+    if (( do_enroll )); then
+        msg "Enrolling Secure Boot keys into firmware..."
+        local mflag=()
+        [[ "${SB_MICROSOFT}" == "1" ]] && mflag=(--microsoft)
+        sbctl enroll-keys "${mflag[@]}" || \
+            warn "Key enrollment failed (firmware not in Setup Mode?). Continuing."
+    else
+        warn "Not enrolling keys (firmware not in Setup Mode or SB_ENROLL=no)."
+        warn "Enroll later with: sbctl enroll-keys --microsoft"
+    fi
+
+    # Sign the binaries Secure Boot actually validates: the bootloader + kernel.
+    msg "Signing bootloader and kernel..."
+    local f
+    for f in \
+        "${ESP_MNT}/EFI/systemd/systemd-bootx64.efi" \
+        "${ESP_MNT}/EFI/BOOT/BOOTX64.EFI" \
+        "${ESP_MNT}/vmlinuz-linux"; do
+        [[ -f "${f}" ]] && { sbctl sign -s "${f}" || warn "Failed to sign ${f}"; }
+    done
+
+    # Persist keys back to the keystore for reproducible re-installs.
+    if [[ -n "${SB_KEYDIR:-}" ]]; then
+        msg "Saving Secure Boot keys to ${SB_KEYDIR}..."
+        mkdir -p "${SB_KEYDIR}"
+        if   [[ -d /var/lib/sbctl ]];        then cp -a /var/lib/sbctl/. "${SB_KEYDIR}/"
+        elif [[ -d /usr/share/secureboot ]]; then cp -a /usr/share/secureboot/. "${SB_KEYDIR}/"
+        fi
+    fi
+}
+
+# --------------------------------------------------------------------------- #
 # Bootloader + squashfs deployment
 # --------------------------------------------------------------------------- #
 deploy() {
@@ -299,6 +388,8 @@ linux   /vmlinuz-linux
 ${ucode_line}initrd  /initramfs-linux.img
 options ramboot_dev=UUID=${LUKS_UUID} ramboot_name=${MAPPER} ramboot_img=/${ROOT_IMG_NAME} copytoram=yes ramboot_cowsize=${COW_SIZE} rw
 EOF
+
+    setup_secureboot
 
     msg "Packing root filesystem into squashfs (${SQUASH_COMP})..."
     # /boot lives on the ESP already; exclude it from the image.

@@ -17,6 +17,10 @@ build() {
     add_module "squashfs"
     add_module "overlay"
 
+    # Filesystem holding the squashfs image inside the LUKS container
+    add_module "f2fs"
+    add_module "ext4"
+
     # LUKS / device-mapper
     add_module "dm-crypt"
     if [[ -n "${CRYPTO_MODULES}" ]]; then

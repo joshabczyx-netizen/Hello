@@ -64,9 +64,12 @@ ramboot_mount_handler() {
     fi
 
     mkdir -p /ramboot/data
-    if ! mount -o ro "${cryptdev}" /ramboot/data; then
-        err "ramboot: failed to mount ${cryptdev}"
-        launch_interactive_shell
+    # Read-only mount; f2fs may refuse a plain 'ro' mount and need 'norecovery'.
+    if ! mount -o ro "${cryptdev}" /ramboot/data 2>/dev/null; then
+        if ! mount -o ro,norecovery "${cryptdev}" /ramboot/data; then
+            err "ramboot: failed to mount ${cryptdev}"
+            launch_interactive_shell
+        fi
     fi
 
     if [ ! -f "/ramboot/data${ramboot_img}" ]; then
