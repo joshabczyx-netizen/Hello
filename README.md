@@ -18,8 +18,8 @@ lives on an internal drive.
 | Root image (`.sfs`) | LUKS2 → f2fs        | **yes**   | yes (read-only)        |
 | Running root     | RAM (tmpfs overlay)   | n/a       | **no — wiped on reboot**² |
 
-² …unless you explicitly snapshot it with `archram-persist save`; see
-[Persistence](#persistence).
+² …unless you explicitly save it with `archram-persist snapshot` (full system)
+or `archram-persist save` (incremental); see [Persistence](#persistence).
 
 ¹ UEFI cannot read LUKS, so the bootloader/kernel/initramfs must sit on an
 unencrypted ESP. Only the OS image itself is encrypted. The bootloader and
@@ -185,38 +185,53 @@ smaller initramfs, add `autodetect` after `base udev` in
 ## Persistence
 
 The system is amnesiac by default — every change lives in the RAM overlay and
-is gone on reboot. When you *do* want to keep what you changed, snapshot the RAM
-overlay back onto the encrypted drive with the bundled **`archram-persist`**
-tool. On the next boot the `ramboot` hook restores that snapshot into the fresh
-RAM overlay (controlled by `ramboot_persist=`, default `auto`).
+is gone on reboot. When you *do* want to keep what you changed, write it back
+onto the encrypted drive with the bundled **`archram-persist`** tool. It has two
+modes:
+
+| Mode                       | What it saves                                   | Result on next boot |
+| -------------------------- | ----------------------------------------------- | ------------------- |
+| `archram-persist snapshot` | **The entire system** — re-images all of `/` into a new squashfs and replaces the base image (`/airootfs.sfs`) | The whole current system is the new base |
+| `archram-persist save`     | Only the overlay **diff** (changes since the base), as `/persist/upper.tar.zst` | Diff is restored on top of the base |
+
+Both write into the LUKS-encrypted partition, so snapshots are **encrypted at
+rest**, and each keeps one `.bak`.
+
+Because the default `copytoram=yes` releases the disk at boot, the drive may
+have been removed. **Re-insert it before saving** — the tool waits for the
+drive, re-unlocks LUKS (prompting for the passphrase), mounts it read-write just
+long enough to write, then closes it again.
+
+```bash
+# After changing the running system, re-insert the drive and pick a mode:
+sudo archram-persist snapshot    # full system image -> drive (encrypted)
+sudo archram-persist save        # or: just the incremental overlay diff
+archram-persist status           # show drive info and sizes
+```
 
 How it works:
 
 - The initramfs bind-mounts the writable overlay layer (the tmpfs `upper`) into
   the running system at `/var/lib/ramboot/cow`, so it stays reachable after
   `switch_root`.
-- `archram-persist save` archives that `upper` (preserving overlay whiteouts,
-  ACLs and `trusted.*` xattrs, so deletions are reproduced) into
-  `/persist/upper.tar.zst` on the LUKS-encrypted f2fs partition.
-- Because the default `copytoram=yes` releases the disk at boot, the drive may
-  have been removed. **Re-insert it before saving** — the tool waits for the
-  drive, re-unlocks LUKS (prompting for the passphrase), mounts it read-write
-  just long enough to write the snapshot, then closes it again.
+- **`snapshot`** runs `mksquashfs /` (excluding virtual filesystems, the package
+  cache and the cow/drive mounts) to build a fresh full-system image, then
+  atomically swaps it in as the boot image and clears the now-redundant diff.
+- **`save`** archives the `upper` with `tar --zstd`, preserving overlay
+  whiteouts, ACLs and `trusted.*` xattrs so deletions are reproduced. The
+  `ramboot` hook restores it into the fresh RAM upper at boot (`ramboot_persist=`,
+  default `auto`).
 
-```bash
-# After making changes in the running system, re-insert the drive and:
-sudo archram-persist save        # snapshot RAM overlay -> drive (encrypted)
-archram-persist status           # show drive info and how much would be saved
-```
+To boot amnesiac for one session, edit the boot entry and set
+`ramboot_persist=no`; to disable diff restore permanently, install with
+`PERSIST=no`.
 
-The snapshot is encrypted at rest (it lives inside the LUKS container) and one
-previous snapshot is kept as `upper.tar.zst.bak`. To boot amnesiac for one
-session, edit the boot entry and set `ramboot_persist=no`; to disable restore
-permanently, install with `PERSIST=no`.
-
-> Snapshot save is supported with `copytoram=yes` (the default). With
-> `copytoram=no` the drive stays mounted for the running system, so it can't be
-> re-mounted read-write for the snapshot.
+> **Notes.** Saving requires `copytoram=yes` (the default); with `copytoram=no`
+> the drive stays mounted for the running system and can't be re-mounted
+> read-write. A `snapshot` re-images only the root filesystem — the
+> kernel/initramfs on the ESP are untouched, so if you **updated the kernel**,
+> re-run the installer to refresh and re-sign the ESP boot files. A full-system
+> image is larger, so remember the RAM-at-boot requirement grows with it.
 
 ## Updating the installed system
 

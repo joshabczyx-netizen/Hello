@@ -1,30 +1,36 @@
 #!/usr/bin/env bash
 #
-# archram-persist - save the in-RAM overlay to the encrypted drive
+# archram-persist - save the in-RAM system to the encrypted drive
 #
-# The running system is an overlayfs whose writable "upper" layer lives in a
-# tmpfs (RAM). The 'ramboot' initramfs hook bind-mounts that tmpfs at
-# /var/lib/ramboot/cow, so this tool can snapshot the live upper and write it
-# back onto the LUKS-encrypted data partition as /persist/upper.tar.zst.
+# The running system is an overlayfs (read-only squashfs "lower" + tmpfs
+# "upper") that lives in RAM, so changes are normally lost on reboot. This tool
+# writes them back onto the LUKS-encrypted data partition. Two modes:
 #
-# On the next boot the 'ramboot' hook restores that snapshot into the fresh RAM
-# upper (unless ramboot_persist=no), so your changes come back.
+#   save       Incremental: archive just the overlay upper (the changes made
+#              since the base image) to /persist/upper.tar.zst. Fast and small.
+#              The 'ramboot' hook restores it on top of the base image at boot.
+#
+#   snapshot   Full system: rebuild the *entire* current root filesystem into a
+#              new squashfs and replace the base image (/airootfs.sfs) on the
+#              drive. The complete current system becomes the new base on the
+#              next boot. Larger and slower, but self-contained.
 #
 # Because the system normally runs with copytoram=yes, the drive is closed and
-# may have been removed after boot. Re-insert it before running 'save' - this
-# tool waits for it, re-unlocks LUKS (prompting for the passphrase) and mounts
-# it read-write just long enough to write the snapshot.
+# may have been removed after boot. Re-insert it before saving - this tool waits
+# for it, re-unlocks LUKS (prompting for the passphrase) and mounts it
+# read-write just long enough to write, then closes it again.
 #
 # Usage:
-#   sudo archram-persist save      # snapshot the RAM overlay to the drive
-#   sudo archram-persist status    # show what would be saved / drive info
+#   sudo archram-persist snapshot   # full system image -> drive (encrypted)
+#   sudo archram-persist save       # incremental overlay diff -> drive
+#   archram-persist status          # show drive info and what would be saved
 #
 set -euo pipefail
 
 COW_DIR="/var/lib/ramboot/cow"
 UPPER="${COW_DIR}/upper"
-PERSIST_REL="persist/upper.tar.zst"     # path on the data filesystem
-SAVE_MAPPER="ramboot_save"              # temporary dm-crypt name for saving
+PERSIST_REL="persist/upper.tar.zst"     # incremental snapshot on the data fs
+SAVE_MAPPER="ramboot_save"              # temporary dm-crypt name while saving
 
 c_red=$'\e[31m'; c_grn=$'\e[32m'; c_ylw=$'\e[33m'; c_blu=$'\e[34m'; c_rst=$'\e[0m'
 msg()  { printf '%s::%s %s\n' "${c_blu}" "${c_rst}" "$*"; }
@@ -33,17 +39,25 @@ warn() { printf '%s::%s %s\n' "${c_ylw}" "${c_rst}" "$*" >&2; }
 die()  { printf '%serror:%s %s\n' "${c_red}" "${c_rst}" "$*" >&2; exit 1; }
 
 # --- parse the kernel command line written by archram-install ---------------
-RAMBOOT_DEV=""; COPYTORAM="yes"; PERSIST="auto"
+RAMBOOT_DEV=""; RAMBOOT_IMG="/airootfs.sfs"; COPYTORAM="yes"; PERSIST="auto"
 parse_cmdline() {
     local tok
     for tok in $(cat /proc/cmdline); do
         case "${tok}" in
             ramboot_dev=*)     RAMBOOT_DEV="${tok#ramboot_dev=}" ;;
+            ramboot_img=*)     RAMBOOT_IMG="${tok#ramboot_img=}" ;;
             copytoram=*)       COPYTORAM="${tok#copytoram=}" ;;
             ramboot_persist=*) PERSIST="${tok#ramboot_persist=}" ;;
         esac
     done
     [[ -n "${RAMBOOT_DEV}" ]] || die "no ramboot_dev= on the kernel command line - not a ramboot system?"
+}
+
+require_root()  { [[ ${EUID} -eq 0 ]] || die "must run as root (try: sudo $0 $*)"; }
+require_upper() {
+    mountpoint -q "${COW_DIR}" || \
+        die "overlay cow not mounted at ${COW_DIR} - not a ramboot system, or the hook did not bind it."
+    [[ -d "${UPPER}" ]] || die "overlay upper directory missing (${UPPER})"
 }
 
 # Resolve the backing device path, waiting for the drive to be (re)inserted.
@@ -66,57 +80,53 @@ resolve_devpath() {
     printf '%s' "$(readlink -f "${target}")"
 }
 
-require_root()  { [[ ${EUID} -eq 0 ]] || die "must run as root (try: sudo $0 $*)"; }
-require_upper() {
-    mountpoint -q "${COW_DIR}" || \
-        die "overlay cow not mounted at ${COW_DIR} - this is not a ramboot system, or the hook did not bind it."
-    [[ -d "${UPPER}" ]] || die "overlay upper directory missing (${UPPER})"
+# --- shared drive open/close ------------------------------------------------
+DRV_MNT=""
+drive_cleanup() {
+    set +e
+    [[ -n "${DRV_MNT}" ]] && mountpoint -q "${DRV_MNT}" && umount "${DRV_MNT}"
+    [[ -n "${DRV_MNT}" ]] && rmdir "${DRV_MNT}" 2>/dev/null
+    cryptsetup status "${SAVE_MAPPER}" >/dev/null 2>&1 && cryptsetup close "${SAVE_MAPPER}"
+}
+open_drive_rw() {
+    if [[ "${COPYTORAM}" != "yes" && "${COPYTORAM}" != "y" ]]; then
+        die "saving requires copytoram=yes (the drive is in use when copytoram=no)."
+    fi
+    local devpath; devpath="$(resolve_devpath)"
+    msg "Using drive ${devpath} (${RAMBOOT_DEV})"
+    cryptsetup status "${SAVE_MAPPER}" >/dev/null 2>&1 && cryptsetup close "${SAVE_MAPPER}"
+    trap drive_cleanup EXIT
+    # Mount under /run so the drive (and the image we write) is naturally
+    # excluded from a full-system mksquashfs of /.
+    DRV_MNT="$(mktemp -d /run/archram-save.XXXXXX)"
+    msg "Unlocking ${devpath}..."
+    cryptsetup open "${devpath}" "${SAVE_MAPPER}"
+    msg "Mounting data filesystem read-write..."
+    mount "/dev/mapper/${SAVE_MAPPER}" "${DRV_MNT}"
 }
 
+# --- subcommands ------------------------------------------------------------
 cmd_status() {
     parse_cmdline
     require_upper
     echo "Backing device : ${RAMBOOT_DEV}"
+    echo "root image     : ${RAMBOOT_IMG}"
     echo "copytoram      : ${COPYTORAM}"
     echo "persist mode   : ${PERSIST}"
     echo "overlay upper  : ${UPPER}"
     echo -n "changed files  : "; find "${UPPER}" -mindepth 1 2>/dev/null | wc -l
     echo -n "upper size     : "; du -sh "${UPPER}" 2>/dev/null | cut -f1
+    echo -n "live root size : "; du -shx / 2>/dev/null | cut -f1
 }
 
 cmd_save() {
     require_root "save"
     parse_cmdline
     require_upper
+    open_drive_rw
 
-    if [[ "${COPYTORAM}" != "yes" && "${COPYTORAM}" != "y" ]]; then
-        die "persistence save requires copytoram=yes (the drive is in use when copytoram=no)."
-    fi
-
-    local devpath; devpath="$(resolve_devpath)"
-    msg "Using drive ${devpath} (${RAMBOOT_DEV})"
-
-    # Clean up any stale temporary mapping from a previous run.
-    cryptsetup status "${SAVE_MAPPER}" >/dev/null 2>&1 && cryptsetup close "${SAVE_MAPPER}"
-
-    local mnt; mnt="$(mktemp -d)"
-    cleanup() {
-        set +e
-        mountpoint -q "${mnt}" && umount "${mnt}"
-        rmdir "${mnt}" 2>/dev/null
-        cryptsetup status "${SAVE_MAPPER}" >/dev/null 2>&1 && cryptsetup close "${SAVE_MAPPER}"
-    }
-    trap cleanup EXIT
-
-    msg "Unlocking ${devpath}..."
-    cryptsetup open "${devpath}" "${SAVE_MAPPER}"
-
-    msg "Mounting data filesystem read-write..."
-    mount "/dev/mapper/${SAVE_MAPPER}" "${mnt}"
-    mkdir -p "${mnt}/persist"
-
-    local dest="${mnt}/${PERSIST_REL}"
-    local tmp="${dest}.new"
+    mkdir -p "${DRV_MNT}/persist"
+    local dest="${DRV_MNT}/${PERSIST_REL}" tmp="${DRV_MNT}/${PERSIST_REL}.new"
 
     msg "Snapshotting overlay upper (${UPPER}) -> ${PERSIST_REL}..."
     sync
@@ -125,35 +135,70 @@ cmd_save() {
     tar -c --zstd --acls --xattrs --xattrs-include='*' --numeric-owner \
         -f "${tmp}" -C "${UPPER}" . || die "snapshot failed"
 
-    # Atomic replace, keeping one backup.
     [[ -f "${dest}" ]] && mv -f "${dest}" "${dest}.bak"
     mv -f "${tmp}" "${dest}"
     sync
+    ok "Saved incremental snapshot ($(du -h "${dest}" | cut -f1)). Restored on next boot."
+}
 
-    local size; size="$(du -h "${dest}" | cut -f1)"
-    ok "Saved snapshot (${size}). It will be restored on the next boot."
+cmd_snapshot() {
+    require_root "snapshot"
+    parse_cmdline
+    command -v mksquashfs >/dev/null 2>&1 || die "mksquashfs not found (install squashfs-tools)."
+    require_upper
+    open_drive_rw
+
+    local img="${DRV_MNT}${RAMBOOT_IMG}" tmp="${DRV_MNT}${RAMBOOT_IMG}.new"
+    local comp="${SQUASH_COMP:-zstd}"
+
+    msg "Building a full system image of / (${comp}) - this can take a while..."
+    sync
+    rm -f "${tmp}"
+    # Image the entire live root, excluding virtual/volatile filesystems, the
+    # package cache, the cow bind-mount and the drive mount itself (under /run).
+    if ! mksquashfs / "${tmp}" -comp "${comp}" -noappend \
+            -e proc sys dev run tmp mnt media \
+               var/tmp var/cache/pacman/pkg var/lib/ramboot/cow lost+found; then
+        die "mksquashfs failed"
+    fi
+
+    [[ -f "${img}" ]] && mv -f "${img}" "${img}.bak"
+    mv -f "${tmp}" "${img}"
+
+    # The full image now contains every change, so drop the incremental diff to
+    # avoid re-applying it on top of itself (keep a backup).
+    if [[ -f "${DRV_MNT}/${PERSIST_REL}" ]]; then
+        mv -f "${DRV_MNT}/${PERSIST_REL}" "${DRV_MNT}/${PERSIST_REL}.bak"
+    fi
+    sync
+    ok "Saved full system image ($(du -h "${img}" | cut -f1)). It is the new base on next boot."
+    warn "The kernel/initramfs on the ESP are unchanged. If you updated the kernel,"
+    warn "re-run the installer to refresh and re-sign the ESP boot files."
 }
 
 main() {
     local sub="${1:-}"
     case "${sub}" in
-        save)        shift; cmd_save "$@" ;;
-        status)      shift; cmd_status "$@" ;;
+        snapshot) shift; cmd_snapshot "$@" ;;
+        save)     shift; cmd_save "$@" ;;
+        status)   shift; cmd_status "$@" ;;
         ""|-h|--help)
             cat <<EOF
-archram-persist - save the in-RAM overlay to the encrypted drive
+archram-persist - save the in-RAM system to the encrypted drive
 
 Usage:
-  sudo archram-persist save      Snapshot the RAM overlay to the drive.
-                                 Re-insert the drive first if it was removed;
-                                 you will be prompted for the LUKS passphrase.
-  archram-persist status         Show drive info and how much would be saved.
+  sudo archram-persist snapshot   Full system: re-image the entire root into a
+                                  new squashfs and replace the base image on the
+                                  drive. The whole current system boots next time.
+  sudo archram-persist save       Incremental: archive only the overlay changes
+                                  (fast); restored on top of the base at boot.
+  archram-persist status          Show drive info and sizes.
 
-The snapshot is restored automatically on the next boot (kernel parameter
-ramboot_persist=auto|yes). Pass ramboot_persist=no to ignore it.
+Re-insert the drive first if it was removed; you will be prompted for the LUKS
+passphrase. Saving requires copytoram=yes (the default).
 EOF
             ;;
-        *) die "unknown subcommand '${sub}' (try: save | status)" ;;
+        *) die "unknown subcommand '${sub}' (try: snapshot | save | status)" ;;
     esac
 }
 

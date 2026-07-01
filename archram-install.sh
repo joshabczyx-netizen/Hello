@@ -60,10 +60,11 @@ SB_MICROSOFT="${SB_MICROSOFT:-1}"    # 1 = also enroll Microsoft vendor certs
 # SB_KEYDIR=/path/to/keystore        # optional persistent sbctl keystore
 
 ROOT_IMG_NAME="airootfs.sfs"          # squashfs filename inside the LUKS fs
-# tar + zstd power 'archram-persist'; f2fs-tools lets the running system fsck
-# the data partition.
+# tar + zstd + squashfs-tools power 'archram-persist' (incremental save and full
+# system re-image); f2fs-tools lets the running system fsck the data partition.
 BASE_PACKAGES="base linux linux-firmware mkinitcpio cryptsetup \
-sudo networkmanager nano vim openssh terminus-font tar zstd f2fs-tools"
+sudo networkmanager nano vim openssh terminus-font \
+tar zstd squashfs-tools f2fs-tools"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKEL_DIR="${SCRIPT_DIR}/airootfs"
