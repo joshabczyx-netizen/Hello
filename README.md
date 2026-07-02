@@ -114,6 +114,7 @@ sudo TARGET_DISK=/dev/nvme0n1 \
 | `SECUREBOOT`      | `1`            | `1` create keys, (maybe) enroll, sign boot chain   |
 | `SB_ENROLL`       | `auto`         | `auto`/`yes`/`no` — enroll keys into firmware      |
 | `SB_MICROSOFT`    | `1`            | `1` also enroll Microsoft vendor certs (`-m`)      |
+| `SB_STORE_KEYS`   | `1`            | Store keys (encrypted) on the drive for in-place re-signing |
 | `SB_KEYDIR`       | *(unset)*      | Persistent sbctl keystore to reuse across installs |
 
 ## Secure Boot
@@ -140,6 +141,13 @@ sbctl enroll-keys --microsoft   # requires Setup Mode
 
 Reuse the same keys across re-installs by pointing `SB_KEYDIR` at persistent
 media (e.g. a USB stick): `SB_KEYDIR=/run/media/usb/sbkeys ./archram-install.sh`.
+
+**In-place re-signing.** With `SB_STORE_KEYS=1` (the default) the sbctl keystore
+is copied into the LUKS partition (encrypted at rest) so the *running* system can
+re-sign the kernel after an update — this is what lets `archram-persist snapshot`
+refresh the ESP without a reinstall (see [Persistence](#persistence)). The stored
+private keys are only as protected as the disk passphrase; set `SB_STORE_KEYS=0`
+to keep them off the drive, at the cost of needing a reinstall for kernel updates.
 
 > **Initramfs caveat.** Secure Boot validates the bootloader and kernel, but the
 > **separate initramfs is not signature-checked** — an attacker who can write to
@@ -217,6 +225,11 @@ How it works:
 - **`snapshot`** runs `mksquashfs /` (excluding virtual filesystems, the package
   cache and the cow/drive mounts) to build a fresh full-system image, then
   atomically swaps it in as the boot image and clears the now-redundant diff.
+  If the installed kernel differs from the booted one it also **refreshes the
+  ESP**: regenerates the initramfs (`mkinitcpio -k <ver>`), copies the new
+  kernel + initramfs to the EFI partition and, when Secure Boot keys are stored
+  on the drive, **re-signs** them. Force or skip with `--refresh-esp` /
+  `--no-refresh-esp`.
 - **`save`** archives the `upper` with `tar --zstd`, preserving overlay
   whiteouts, ACLs and `trusted.*` xattrs so deletions are reproduced. The
   `ramboot` hook restores it into the fresh RAM upper at boot (`ramboot_persist=`,
@@ -228,21 +241,22 @@ To boot amnesiac for one session, edit the boot entry and set
 
 > **Notes.** Saving requires `copytoram=yes` (the default); with `copytoram=no`
 > the drive stays mounted for the running system and can't be re-mounted
-> read-write. A `snapshot` re-images only the root filesystem — the
-> kernel/initramfs on the ESP are untouched, so if you **updated the kernel**,
-> re-run the installer to refresh and re-sign the ESP boot files. A full-system
-> image is larger, so remember the RAM-at-boot requirement grows with it.
+> read-write. A full-system image is larger, so remember the RAM-at-boot
+> requirement grows with it. Kernel updates are handled automatically by the ESP
+> refresh above **as long as** `SB_STORE_KEYS=1` was used at install time (so the
+> running system holds the signing keys); otherwise `snapshot` leaves the signed
+> ESP kernel in place and you must re-run the installer to change the kernel.
 
 ## Updating the installed system
 
-Because the running root is in RAM, changes do not persist. To change packages
-or configuration, **re-run the installer** (it rebuilds and rewrites the
-squashfs). The disk passphrase and layout can be reused; the erase step still
-applies, so back up anything you stored elsewhere on that disk.
+The recommended workflow is to update the running system normally
+(`pacman -Syu`, edit configs, etc.) and then bake it in with
+`sudo archram-persist snapshot` — this rewrites the base image and, on a kernel
+update, refreshes and re-signs the ESP too (see [Persistence](#persistence)).
 
-For lightweight tweaks without a full reinstall you can instead mount the LUKS
-partition, replace `/airootfs.sfs` with a freshly built squashfs, and update
-the ESP kernel/initramfs if the kernel changed.
+Alternatively, **re-run the installer** from the live ISO to rebuild from
+scratch (the disk passphrase and layout can be reused, but the erase step still
+applies — back up anything else on that disk first).
 
 ## Security notes
 

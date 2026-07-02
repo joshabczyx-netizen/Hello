@@ -81,18 +81,24 @@ resolve_devpath() {
 }
 
 # --- shared drive open/close ------------------------------------------------
-DRV_MNT=""
+DRV_MNT=""; DRV_DEV=""; ESP_MNT=""; SB_RESTORED=0
 drive_cleanup() {
     set +e
+    [[ -n "${ESP_MNT}" ]] && mountpoint -q "${ESP_MNT}" && umount "${ESP_MNT}"
+    [[ -n "${ESP_MNT}" ]] && rmdir "${ESP_MNT}" 2>/dev/null
     [[ -n "${DRV_MNT}" ]] && mountpoint -q "${DRV_MNT}" && umount "${DRV_MNT}"
     [[ -n "${DRV_MNT}" ]] && rmdir "${DRV_MNT}" 2>/dev/null
     cryptsetup status "${SAVE_MAPPER}" >/dev/null 2>&1 && cryptsetup close "${SAVE_MAPPER}"
+    # Drop the Secure Boot keystore we restored into RAM to sign, so it can't
+    # leak into a future full-system image.
+    (( SB_RESTORED )) && rm -rf /var/lib/sbctl 2>/dev/null
 }
 open_drive_rw() {
     if [[ "${COPYTORAM}" != "yes" && "${COPYTORAM}" != "y" ]]; then
         die "saving requires copytoram=yes (the drive is in use when copytoram=no)."
     fi
     local devpath; devpath="$(resolve_devpath)"
+    DRV_DEV="${devpath}"
     msg "Using drive ${devpath} (${RAMBOOT_DEV})"
     cryptsetup status "${SAVE_MAPPER}" >/dev/null 2>&1 && cryptsetup close "${SAVE_MAPPER}"
     trap drive_cleanup EXIT
@@ -103,6 +109,103 @@ open_drive_rw() {
     cryptsetup open "${devpath}" "${SAVE_MAPPER}"
     msg "Mounting data filesystem read-write..."
     mount "/dev/mapper/${SAVE_MAPPER}" "${DRV_MNT}"
+}
+
+# --- ESP refresh (kernel + initramfs + Secure Boot re-sign) -----------------
+
+# Kernel version of the installed 'linux' package (its modules directory).
+installed_kver() {
+    local d
+    for d in /usr/lib/modules/*/; do
+        [[ -f "${d}vmlinuz" && -f "${d}pkgbase" ]] || continue
+        [[ "$(cat "${d}pkgbase")" == "linux" ]] && { basename "${d}"; return 0; }
+    done
+    for d in /usr/lib/modules/*/; do
+        [[ -f "${d}vmlinuz" ]] && { basename "${d}"; return 0; }
+    done
+    return 1
+}
+
+# Locate the ESP: the vfat sibling partition (same disk as the LUKS device)
+# that holds our systemd-boot entry. Echoes the partition device.
+find_esp_part() {
+    local disk p m
+    disk="/dev/$(lsblk -no pkname "${DRV_DEV}" 2>/dev/null | head -1)"
+    [[ -b "${disk}" ]] || return 1
+    while read -r p; do
+        [[ "${p}" == "${disk}" ]] && continue
+        [[ "$(blkid -s TYPE -o value "${p}" 2>/dev/null)" == "vfat" ]] || continue
+        m="$(mktemp -d)"
+        if mount -o ro "${p}" "${m}" 2>/dev/null; then
+            if [[ -f "${m}/loader/entries/archram.conf" ]]; then
+                umount "${m}"; rmdir "${m}"; echo "${p}"; return 0
+            fi
+            umount "${m}"
+        fi
+        rmdir "${m}"
+    done < <(lsblk -lnpo NAME "${disk}")
+    return 1
+}
+
+# Refresh the ESP when the installed kernel differs from the booted one, so a
+# full snapshot stays bootable across kernel updates. mode: auto|yes|no.
+maybe_refresh_esp() {
+    local mode="$1"
+    [[ "${mode}" == "no" ]] && return 0
+
+    local kver booted
+    kver="$(installed_kver)" || { warn "could not determine installed kernel; skipping ESP refresh"; return 0; }
+    booted="$(uname -r)"
+
+    if [[ "${mode}" == "auto" && "${kver}" == "${booted}" ]]; then
+        msg "Kernel unchanged (${booted}); ESP left as-is."
+        return 0
+    fi
+    msg "Refreshing ESP for kernel ${kver} (booted: ${booted})..."
+
+    local sb_marker=0 keys=0
+    [[ -e "${DRV_MNT}/sbctl/secureboot" ]] && sb_marker=1
+    [[ -d "${DRV_MNT}/sbctl/keys" ]] && keys=1
+    if (( sb_marker && ! keys )); then
+        warn "Secure Boot is configured but its keys are not on the drive."
+        warn "Refusing to replace the signed ESP kernel (it would fail to boot)."
+        warn "Reinstall with SB_STORE_KEYS=1, or re-run the installer to update the kernel."
+        return 0
+    fi
+
+    local esp; esp="$(find_esp_part)" || { warn "could not locate the ESP; skipping ESP refresh"; return 0; }
+    msg "ESP partition: ${esp}"
+
+    local tmpk; tmpk="$(mktemp -d)"
+    msg "Generating initramfs for ${kver}..."
+    if ! mkinitcpio -k "${kver}" -g "${tmpk}/initramfs-linux.img"; then
+        warn "mkinitcpio failed; leaving the ESP unchanged"
+        rm -rf "${tmpk}"; return 0
+    fi
+
+    ESP_MNT="$(mktemp -d)"
+    mount "${esp}" "${ESP_MNT}"
+    cp "/usr/lib/modules/${kver}/vmlinuz" "${ESP_MNT}/vmlinuz-linux"
+    cp "${tmpk}/initramfs-linux.img" "${ESP_MNT}/initramfs-linux.img"
+    rm -rf "${tmpk}"
+
+    if (( keys )); then
+        msg "Re-signing kernel and bootloader for Secure Boot..."
+        command -v sbctl >/dev/null 2>&1 || { warn "sbctl missing; kernel copied UNSIGNED"; return 0; }
+        rm -rf /var/lib/sbctl; mkdir -p /var/lib/sbctl
+        cp -a "${DRV_MNT}/sbctl/." /var/lib/sbctl/
+        SB_RESTORED=1
+        local f
+        for f in "${ESP_MNT}/vmlinuz-linux" \
+                 "${ESP_MNT}/EFI/systemd/systemd-bootx64.efi" \
+                 "${ESP_MNT}/EFI/BOOT/BOOTX64.EFI"; do
+            [[ -f "${f}" ]] && { sbctl sign -s "${f}" || warn "failed to sign ${f}"; }
+        done
+    fi
+
+    sync
+    umount "${ESP_MNT}"; rmdir "${ESP_MNT}"; ESP_MNT=""
+    ok "ESP refreshed for kernel ${kver}."
 }
 
 # --- subcommands ------------------------------------------------------------
@@ -117,6 +220,8 @@ cmd_status() {
     echo -n "changed files  : "; find "${UPPER}" -mindepth 1 2>/dev/null | wc -l
     echo -n "upper size     : "; du -sh "${UPPER}" 2>/dev/null | cut -f1
     echo -n "live root size : "; du -shx / 2>/dev/null | cut -f1
+    echo    "booted kernel  : $(uname -r)"
+    echo    "installed kver : $(installed_kver || echo '?')"
 }
 
 cmd_save() {
@@ -143,6 +248,15 @@ cmd_save() {
 
 cmd_snapshot() {
     require_root "snapshot"
+    local refresh="auto"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --refresh-esp)    refresh="yes" ;;
+            --no-refresh-esp) refresh="no" ;;
+            *) die "unknown option '$1' (try: --refresh-esp | --no-refresh-esp)" ;;
+        esac
+        shift
+    done
     parse_cmdline
     command -v mksquashfs >/dev/null 2>&1 || die "mksquashfs not found (install squashfs-tools)."
     require_upper
@@ -172,8 +286,9 @@ cmd_snapshot() {
     fi
     sync
     ok "Saved full system image ($(du -h "${img}" | cut -f1)). It is the new base on next boot."
-    warn "The kernel/initramfs on the ESP are unchanged. If you updated the kernel,"
-    warn "re-run the installer to refresh and re-sign the ESP boot files."
+
+    # Keep the ESP kernel/initramfs in sync (and re-signed) across kernel updates.
+    maybe_refresh_esp "${refresh}"
 }
 
 main() {
@@ -187,12 +302,18 @@ main() {
 archram-persist - save the in-RAM system to the encrypted drive
 
 Usage:
-  sudo archram-persist snapshot   Full system: re-image the entire root into a
+  sudo archram-persist snapshot [--refresh-esp|--no-refresh-esp]
+                                  Full system: re-image the entire root into a
                                   new squashfs and replace the base image on the
                                   drive. The whole current system boots next time.
+                                  If the installed kernel differs from the booted
+                                  one, the ESP kernel/initramfs are regenerated
+                                  and re-signed for Secure Boot (override with the
+                                  flags). Needs the keystore stored on the drive
+                                  (installer SB_STORE_KEYS=1, the default).
   sudo archram-persist save       Incremental: archive only the overlay changes
                                   (fast); restored on top of the base at boot.
-  archram-persist status          Show drive info and sizes.
+  archram-persist status          Show drive info, sizes and kernel versions.
 
 Re-insert the drive first if it was removed; you will be prompted for the LUKS
 passphrase. Saving requires copytoram=yes (the default).

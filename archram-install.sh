@@ -57,14 +57,18 @@ ASSUME_YES="${ASSUME_YES:-0}"
 SECUREBOOT="${SECUREBOOT:-1}"        # 1 = create keys, (maybe) enroll, sign
 SB_ENROLL="${SB_ENROLL:-auto}"       # auto|yes|no - enroll keys into firmware
 SB_MICROSOFT="${SB_MICROSOFT:-1}"    # 1 = also enroll Microsoft vendor certs
+SB_STORE_KEYS="${SB_STORE_KEYS:-1}"  # 1 = store keys (encrypted) on the drive so
+                                     #     the running system can re-sign the
+                                     #     kernel after in-place updates
 # SB_KEYDIR=/path/to/keystore        # optional persistent sbctl keystore
 
 ROOT_IMG_NAME="airootfs.sfs"          # squashfs filename inside the LUKS fs
 # tar + zstd + squashfs-tools power 'archram-persist' (incremental save and full
-# system re-image); f2fs-tools lets the running system fsck the data partition.
+# system re-image); sbctl lets it re-sign the kernel after an in-place update;
+# f2fs-tools lets the running system fsck the data partition.
 BASE_PACKAGES="base linux linux-firmware mkinitcpio cryptsetup \
 sudo networkmanager nano vim openssh terminus-font \
-tar zstd squashfs-tools f2fs-tools"
+tar zstd squashfs-tools sbctl f2fs-tools"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKEL_DIR="${SCRIPT_DIR}/airootfs"
@@ -350,6 +354,20 @@ setup_secureboot() {
         if   [[ -d /var/lib/sbctl ]];        then cp -a /var/lib/sbctl/. "${SB_KEYDIR}/"
         elif [[ -d /usr/share/secureboot ]]; then cp -a /usr/share/secureboot/. "${SB_KEYDIR}/"
         fi
+    fi
+
+    # Store the keystore (and a marker) inside the LUKS partition so the running
+    # system can re-sign the kernel after an in-place update. Encrypted at rest.
+    mkdir -p "${DATA_MNT}/sbctl"
+    : > "${DATA_MNT}/sbctl/secureboot"        # marker: Secure Boot is in use
+    if [[ "${SB_STORE_KEYS}" == "1" ]]; then
+        msg "Storing Secure Boot keys on the encrypted drive..."
+        if   [[ -d /var/lib/sbctl ]];        then cp -a /var/lib/sbctl/. "${DATA_MNT}/sbctl/"
+        elif [[ -d /usr/share/secureboot ]]; then cp -a /usr/share/secureboot/. "${DATA_MNT}/sbctl/"
+        fi
+        chmod -R go-rwx "${DATA_MNT}/sbctl"
+    else
+        warn "SB_STORE_KEYS=0: keys not stored on drive; kernel updates will need a reinstall."
     fi
 }
 
