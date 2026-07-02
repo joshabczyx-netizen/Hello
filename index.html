@@ -97,6 +97,8 @@
       <input id="max" type="number" value="18" />
     </div>
     <button id="roll">Roll NPCs</button>
+    <button id="csv">Download CSV</button>
+    <button id="json">Download JSON</button>
   </div>
 
   <div class="meta" id="meta"></div>
@@ -111,6 +113,9 @@
   <script>
     const $ = (id) => document.getElementById(id);
 
+    let currentNpcs = [];
+    let currentColumns = [];
+
     function render() {
       const count = Math.max(1, parseInt($('count').value, 10) || 1);
       let min = parseInt($('min').value, 10);
@@ -119,6 +124,8 @@
 
       const npcs = generateNpcs(count, min, max);
       const columns = ['id', ...STATS];
+      currentNpcs = npcs;
+      currentColumns = columns;
 
       // Header
       $('thead').innerHTML =
@@ -138,7 +145,32 @@
         `Showing ${npcs.length} NPCs · stats rolled between ${min} and ${max}.`;
     }
 
+    // Trigger a browser download for the given text content.
+    function download(filename, text, mime) {
+      const blob = new Blob([text], { type: mime });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+
+    function toCsv(npcs, columns) {
+      const header = columns.join(',');
+      const rows = npcs.map((npc) => columns.map((c) => npc[c]).join(','));
+      return [header, ...rows].join('\n');
+    }
+
     $('roll').addEventListener('click', render);
+    $('csv').addEventListener('click', () =>
+      download('npcs.csv', toCsv(currentNpcs, currentColumns), 'text/csv')
+    );
+    $('json').addEventListener('click', () =>
+      download('npcs.json', JSON.stringify(currentNpcs, null, 2), 'application/json')
+    );
     render(); // initial render on load
   </script>
 </body>
