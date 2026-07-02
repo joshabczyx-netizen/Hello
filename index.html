@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NPC Stat Randomizer</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --panel: #1a1d24;
+      --border: #2a2f3a;
+      --text: #e6e8ec;
+      --muted: #9aa2b1;
+      --accent: #6ea8fe;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 24px;
+    }
+    h1 { margin: 0 0 4px; font-size: 1.5rem; }
+    p.sub { margin: 0 0 20px; color: var(--muted); }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: flex-end;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+      margin-bottom: 20px;
+    }
+    .field { display: flex; flex-direction: column; gap: 4px; }
+    .field label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    .field input {
+      width: 110px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 0.95rem;
+    }
+    button {
+      background: var(--accent);
+      color: #0b1220;
+      border: none;
+      border-radius: 6px;
+      padding: 9px 18px;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:hover { filter: brightness(1.08); }
+    .meta { color: var(--muted); font-size: 0.9rem; margin-bottom: 10px; }
+    .table-wrap {
+      max-height: 60vh;
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+    table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+    thead th {
+      position: sticky;
+      top: 0;
+      background: var(--panel);
+      text-align: left;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+      text-transform: capitalize;
+    }
+    tbody td { padding: 8px 14px; border-bottom: 1px solid var(--border); }
+    tbody tr:nth-child(even) { background: rgba(255,255,255,0.02); }
+    tbody tr:hover { background: rgba(110,168,254,0.08); }
+    td.id { color: var(--muted); }
+  </style>
+</head>
+<body>
+  <h1>NPC Stat Randomizer</h1>
+  <p class="sub">Roll five basic stats for a batch of NPCs.</p>
+
+  <div class="controls">
+    <div class="field">
+      <label for="count">NPC count</label>
+      <input id="count" type="number" min="1" max="100000" value="1000" />
+    </div>
+    <div class="field">
+      <label for="min">Stat min</label>
+      <input id="min" type="number" value="3" />
+    </div>
+    <div class="field">
+      <label for="max">Stat max</label>
+      <input id="max" type="number" value="18" />
+    </div>
+    <button id="roll">Roll NPCs</button>
+  </div>
+
+  <div class="meta" id="meta"></div>
+  <div class="table-wrap">
+    <table>
+      <thead id="thead"></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+
+  <script src="npcStatRandomizer.js"></script>
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    function render() {
+      const count = Math.max(1, parseInt($('count').value, 10) || 1);
+      let min = parseInt($('min').value, 10);
+      let max = parseInt($('max').value, 10);
+      if (min > max) { [min, max] = [max, min]; }
+
+      const npcs = generateNpcs(count, min, max);
+      const columns = ['id', ...STATS];
+
+      // Header
+      $('thead').innerHTML =
+        '<tr>' + columns.map((c) => `<th>${c}</th>`).join('') + '</tr>';
+
+      // Body (build as one string for speed with large counts)
+      const rows = npcs.map((npc) =>
+        '<tr>' +
+        columns
+          .map((c) => `<td class="${c === 'id' ? 'id' : ''}">${npc[c]}</td>`)
+          .join('') +
+        '</tr>'
+      );
+      $('tbody').innerHTML = rows.join('');
+
+      $('meta').textContent =
+        `Showing ${npcs.length} NPCs · stats rolled between ${min} and ${max}.`;
+    }
+
+    $('roll').addEventListener('click', render);
+    render(); // initial render on load
+  </script>
+</body>
+</html>

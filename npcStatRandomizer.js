@@ -54,10 +54,13 @@ function generateNpcs(count = 1000, min = DEFAULT_MIN, max = DEFAULT_MAX) {
 }
 
 // Run directly with `node npcStatRandomizer.js` to print 1000 NPCs.
-if (require.main === module) {
+if (typeof require !== 'undefined' && require.main === module) {
   const npcs = generateNpcs(1000);
   console.log(`Generated ${npcs.length} NPCs. Sample:`);
   console.table(npcs.slice(0, 5));
 }
 
-module.exports = { STATS, randomInt, generateNpc, generateNpcs };
+// Export for Node (CommonJS); safely ignored when loaded in the browser.
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { STATS, randomInt, generateNpc, generateNpcs };
+}
