@@ -18,6 +18,10 @@ htmlcov/
 venv/
 env/
 
+# Generated tournament outputs (the trained nn_weights.npz IS committed)
+bankrolls.svg
+bankrolls.csv
+
 # Editors / OS
 .vscode/
 .idea/

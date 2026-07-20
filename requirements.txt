@@ -1,0 +1,6 @@
+# Core advisor (blackjack_advisor.py) needs only the standard library.
+# The simulation (blackjack_sim/) and its neural net need numpy.
+numpy>=1.21
+
+# For running the test suite.
+pytest>=7.0
