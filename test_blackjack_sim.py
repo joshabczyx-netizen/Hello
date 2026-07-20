@@ -14,7 +14,8 @@ from blackjack_sim.engine import (
 )
 from blackjack_sim.agents import CounterAgent, FlatAgent, NeuralAgent
 from blackjack_sim.neural import BettingNet, features, MAX_BET_FRACTION
-from blackjack_sim.tournament import run_tournament
+from blackjack_sim.deviations import PlayNet, make_override, play_features
+from blackjack_sim.tournament import run_sweep, run_tournament, run_trials
 
 
 # --------------------------------------------------------------------------- #
@@ -206,3 +207,85 @@ def test_tournament_is_reproducible_with_seed():
     a = run().results[0].final_bankroll
     b = run().results[0].final_bankroll
     assert a == b
+
+
+# --------------------------------------------------------------------------- #
+# Playing deviations
+# --------------------------------------------------------------------------- #
+def test_play_features_onehot():
+    from blackjack_sim.deviations import N_PLAY_FEATURES
+    f = play_features(16, 10, 20)
+    assert f.shape == (N_PLAY_FEATURES,)
+    # one-hot total (12-16) and up (2-11), plus a clamped true count
+    assert f[16 - 12] == 1.0          # total 16
+    assert f[5 + (10 - 2)] == 1.0     # up 10
+    assert -3.0 <= f[15] <= 3.0       # clamped tc
+
+
+def test_playnet_params_round_trip_and_advantage():
+    net = PlayNet()
+    adv = net.stand_advantage(16, 10, 0)
+    assert isinstance(adv, float)
+    theta = net.get_params()
+    net.set_params(theta)
+    assert pytest.approx(theta) == net.get_params()
+
+
+def test_override_only_touches_hard_12_16():
+    net = PlayNet()
+    override = make_override(net)
+    # Hard 16 -> either a deviation (S/H) or None (play basic).
+    assert override(["10", "6"], 10, 0.0) in ("S", "H", None)
+    # Hard 17 -> not the net's concern.
+    assert override(["10", "7"], 10, 0.0) is None
+    # Soft 15 (A,4) -> not a hard stiff, leave to basic strategy.
+    assert override(["A", "4"], 10, 0.0) is None
+    # Hard 11 -> below the stiff range.
+    assert override(["6", "5"], 10, 0.0) is None
+
+
+def test_override_changes_play_round_outcome_distribution():
+    # A net that always wants to stand must change results vs. basic strategy.
+    class AlwaysStand:
+        def stand_advantage(self, total, up, tc):
+            return 10.0  # huge advantage -> deviate hit->stand everywhere
+    override = make_override(AlwaysStand())
+    a = b = 0.0
+    sa = Shoe(rng=random.Random(5))
+    sb = Shoe(rng=random.Random(5))
+    for _ in range(5000):
+        if sa.needs_shuffle():
+            sa.shuffle(); sb.shuffle()
+        a += play_round(sa, 1.0)
+        b += play_round(sb, 1.0, play_override=override)
+    assert a != b
+
+
+# --------------------------------------------------------------------------- #
+# Multi-session + sweep aggregation
+# --------------------------------------------------------------------------- #
+def test_run_trials_tracks_ruin_and_beats():
+    net = BettingNet()
+
+    def make():
+        return [CounterAgent("Counter-1", 200, max_units=8),
+                NeuralAgent("NeuralNet", 200, net)]
+
+    summ = run_trials(make, trials=20, rounds=300, seed=1)
+    assert summ.trials == 20
+    assert summ.counter_count == 20
+    assert 0.0 <= summ.counter_ruin_rate <= 1.0
+    assert 0 <= summ.nn_beats_counter_avg <= 20
+
+
+def test_run_sweep_shape():
+    net = BettingNet()
+
+    def make_for(bankroll):
+        return [CounterAgent("Counter-1", bankroll),
+                NeuralAgent("NeuralNet", bankroll, net)]
+
+    sweep = run_sweep(make_for, [500, 2000], trials=10, rounds=200, seed=2)
+    assert [b for b, _ in sweep] == [500, 2000]
+    for _, summary in sweep:
+        assert summary.trials == 10

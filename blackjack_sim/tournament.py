@@ -75,7 +75,8 @@ def run_tournament(
                     agent.busted_at = rnd
                 else:
                     stake = agent.bet(shoe, table)
-                    profit = play_round(shoe, stake)
+                    profit = play_round(shoe, stake,
+                                        play_override=agent.play_override)
                     # A player can never lose more than their bankroll (they
                     # can't stake funds they don't have to double/split).
                     agent.bankroll = max(0.0, agent.bankroll + profit)
@@ -109,6 +110,9 @@ class TrialsSummary:
     counter_finals: List[float]
     neural_finals: List[float]
     nn_beats_counter_avg: int  # sessions the NN beat the counters' session mean
+    counter_ruins: int = 0     # counter agents that hit $0 (across all sessions)
+    counter_count: int = 0     # total counter agents played
+    neural_ruins: int = 0      # neural agents that hit $0
 
     def _stats(self, finals: List[float], start: float) -> Dict[str, float]:
         return {
@@ -116,9 +120,18 @@ class TrialsSummary:
             "median": statistics.median(finals),
             "min": min(finals),
             "max": max(finals),
-            "bust_rate": sum(1 for f in finals if f < start) / len(finals),
+            "roi_pct": 100.0 * (statistics.mean(finals) - start) / start,
+            "below_start_rate": sum(1 for f in finals if f < start) / len(finals),
             "profit_rate": sum(1 for f in finals if f > start) / len(finals),
         }
+
+    @property
+    def counter_ruin_rate(self) -> float:
+        return self.counter_ruins / max(self.counter_count, 1)
+
+    @property
+    def neural_ruin_rate(self) -> float:
+        return self.neural_ruins / max(self.trials, 1)
 
     def format(self, start_bankroll: float) -> str:
         c = self._stats(self.counter_finals, start_bankroll)
@@ -136,8 +149,10 @@ class TrialsSummary:
             f"  {'worst session':<22}{c['min']:>22,.0f}{n['min']:>22,.0f}",
             f"  {'ended profitable':<22}{c['profit_rate']*100:>21.0f}%"
             f"{n['profit_rate']*100:>21.0f}%",
-            f"  {'ended below start':<22}{c['bust_rate']*100:>21.0f}%"
-            f"{n['bust_rate']*100:>21.0f}%",
+            f"  {'ended below start':<22}{c['below_start_rate']*100:>21.0f}%"
+            f"{n['below_start_rate']*100:>21.0f}%",
+            f"  {'went bust ($0)':<22}{self.counter_ruin_rate*100:>21.1f}%"
+            f"{self.neural_ruin_rate*100:>21.1f}%",
             "-" * 68,
             f"  NeuralNet beat the counters' average in "
             f"{self.nn_beats_counter_avg}/{self.trials} sessions "
@@ -163,17 +178,23 @@ def run_trials(
     counter_finals: List[float] = []
     neural_finals: List[float] = []
     nn_beats = 0
+    counter_ruins = 0
+    counter_count = 0
+    neural_ruins = 0
     for _ in range(trials):
         agents = make_agents()
         result = run_tournament(agents, rounds=rounds, table=table,
                                 seed=base.randrange(2**31))
-        session_counters = [r.final_bankroll for r in result.results
+        session_counters = [r for r in result.results
                             if r.name.startswith("Counter")]
-        nn_final = next(r.final_bankroll for r in result.results
-                        if r.name == "NeuralNet")
-        counter_finals.extend(session_counters)
-        neural_finals.append(nn_final)
-        if nn_final > statistics.mean(session_counters):
+        nn = next(r for r in result.results if r.name == "NeuralNet")
+        counter_finals.extend(r.final_bankroll for r in session_counters)
+        neural_finals.append(nn.final_bankroll)
+        counter_count += len(session_counters)
+        counter_ruins += sum(1 for r in session_counters if r.busted_at)
+        neural_ruins += 1 if nn.busted_at else 0
+        if nn.final_bankroll > statistics.mean(
+                [r.final_bankroll for r in session_counters]):
             nn_beats += 1
     return TrialsSummary(
         trials=trials,
@@ -181,7 +202,51 @@ def run_trials(
         counter_finals=counter_finals,
         neural_finals=neural_finals,
         nn_beats_counter_avg=nn_beats,
+        counter_ruins=counter_ruins,
+        counter_count=counter_count,
+        neural_ruins=neural_ruins,
     )
+
+
+def run_sweep(
+    make_agents_for,
+    bankrolls: Sequence[float],
+    trials: int,
+    rounds: int,
+    table: Table | None = None,
+    seed: int | None = None,
+) -> List[tuple]:
+    """Run a trials batch at each starting bankroll.
+
+    `make_agents_for(bankroll)` returns a fresh agent list for that bankroll.
+    Returns a list of (bankroll, TrialsSummary).
+    """
+    out = []
+    for b in bankrolls:
+        summary = run_trials(lambda b=b: make_agents_for(b), trials=trials,
+                             rounds=rounds, table=table, seed=seed)
+        out.append((b, summary))
+    return out
+
+
+def format_sweep(sweep: List[tuple]) -> str:
+    lines = [
+        "=" * 74,
+        "  BANKROLL SWEEP  (mean ROI and ruin rate by starting bankroll)",
+        "=" * 74,
+        f"  {'bankroll':>10} | {'Counter ROI':>12}{'Counter ruin':>14}"
+        f" | {'Neural ROI':>12}{'Neural ruin':>13}",
+        "-" * 74,
+    ]
+    for b, s in sweep:
+        c = s._stats(s.counter_finals, b)
+        n = s._stats(s.neural_finals, b)
+        lines.append(
+            f"  {b:>10,.0f} | {c['roi_pct']:>11.1f}%{s.counter_ruin_rate*100:>13.1f}%"
+            f" | {n['roi_pct']:>11.1f}%{s.neural_ruin_rate*100:>12.1f}%"
+        )
+    lines.append("=" * 74)
+    return "\n".join(lines)
 
 
 def format_standings(result: TournamentResult) -> str:

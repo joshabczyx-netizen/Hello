@@ -33,6 +33,11 @@ def main() -> int:
     p.add_argument("--bankroll", type=float, default=1000.0)
     p.add_argument("--counters", type=int, default=4)
     p.add_argument("--weights", default="nn_weights.npz")
+    p.add_argument("--play-weights", default="play_weights.npz",
+                   help="Deviation-net weights, used when --deviations is set.")
+    p.add_argument("--deviations", action="store_true",
+                   help="All agents use the learned count-based playing "
+                        "deviations instead of pure basic strategy.")
     p.add_argument("--min-bet", type=float, default=10.0)
     p.add_argument("--max-bet", type=float, default=500.0)
     p.add_argument("--max-units", type=float, default=8.0,
@@ -55,13 +60,24 @@ def main() -> int:
         print(f"! {args.weights} not found -- using an UNTRAINED net. "
               f"Run 'python train_nn.py' first for a real competitor.")
 
+    override = None
+    if args.deviations:
+        if os.path.exists(args.play_weights):
+            from blackjack_sim.deviations import PlayNet, make_override
+            override = make_override(PlayNet.load(args.play_weights))
+            print(f"Using learned playing deviations from {args.play_weights}")
+        else:
+            print(f"! {args.play_weights} not found -- run "
+                  f"'python train_deviations.py'. Using basic strategy.")
+
     def make_agents():
         agents = [
             CounterAgent(f"Counter-{i+1}", args.bankroll,
-                         max_units=args.max_units)
+                         max_units=args.max_units, play_override=override)
             for i in range(args.counters)
         ]
-        agents.append(NeuralAgent("NeuralNet", args.bankroll, net))
+        agents.append(NeuralAgent("NeuralNet", args.bankroll, net,
+                                  play_override=override))
         return agents
 
     table = Table(min_bet=args.min_bet, max_bet=args.max_bet)

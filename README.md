@@ -179,6 +179,78 @@ The honest takeaways:
   the same risk/return curve. Counting is real, but it needs a big bankroll and
   a wide spread (or many sessions) to overcome the house edge dependably.
 
+## Bankroll sweep: why counting needs a big bankroll
+
+`sweep.py` reruns the tournament across a range of starting bankrolls (fixed
+$10 table) to show how the payoff depends on bankroll size.
+
+```bash
+python sweep.py --trials 400 --rounds 500 --chart sweep.svg
+```
+
+Representative output (mean ROI and true ruin rate, 300 sessions x 500 rounds):
+
+| bankroll | Counter ROI | Counter ruin | Neural ROI | Neural ruin |
+|---------:|------------:|-------------:|-----------:|------------:|
+| $500     | −2.1%       | **18.8%**    | −4.4%      | 7.0%        |
+| $1,000   | −1.1%       | 1.0%         | −1.5%      | 0.0%        |
+| $2,000   | −0.5%       | 0.0%         | 0.0%       | 0.0%        |
+| $5,000   | −0.2%       | 0.0%         | +0.9%      | 0.0%        |
+| $10,000  | −0.1%       | 0.0%         | **+1.1%**  | 0.0%        |
+| $50,000  | −0.0%       | 0.0%         | +0.4%      | 0.0%        |
+
+What this shows:
+
+- **Ruin risk is a small-bankroll problem.** The counters' aggressive 1–8
+  spread ruins ~19% of $500 rolls but essentially never busts a $2,000+ roll.
+- **The Kelly net only turns profitable once the bankroll clears the forced
+  minimum** — negative at $500–$1,000 (the $10 min forces over-betting on bad
+  counts), crossing zero near $2,000 and peaking around +1% at $10,000.
+- Above ~$10k the net's ROI dips again because the $500 **table maximum** caps
+  its Kelly bets, so it can no longer scale with the bankroll.
+
+The headline lesson of the whole project: *counting is real, but its edge is
+thin and only pays reliably with a bankroll large relative to the table minimum
+and small relative to the table maximum.*
+
+## Neural playing deviations (index plays)
+
+Basic strategy is fixed, but the best *play* on borderline stiff hands shifts
+with the count — the classic "index plays" (stand on 16 vs 10 when the deck is
+ten-rich, etc.). `blackjack_sim/deviations.py` trains a second neural net
+(`PlayNet`) on the highest-value group of these — the **hard 12–16 stand/hit
+decisions** — purely from expected value.
+
+How it learns (and why the first approach failed): evaluating a decision by
+playing one hand is far too noisy (±1 per hand) for the ~0.02 EV a deviation is
+worth. The trainer instead uses **paired common random numbers** — it plays both
+*stand* and *hit* on the *same* deck continuation, so the EV *difference* is a
+low-variance target — builds a dataset of `(state, stand-advantage)` pairs, and
+fits the net by supervised regression. The net then deviates only when it
+predicts the non-basic action wins by a margin.
+
+```bash
+# Train the deviation net (~1-2 min), saves play_weights.npz, prints what it learned
+python train_deviations.py
+
+# Run the tournament with all agents using the learned deviations
+python compete.py --deviations --trials 500 --rounds 500
+```
+
+What it learns and what it's worth:
+
+- The net recovers the **direction and rough thresholds of the real index
+  plays** — e.g. stand on 16 vs 10 and 15 vs 10 as the count climbs — validated
+  against the engine's own EV. (Rare high-count cells stay noisy; there is
+  little data out there.)
+- The measured **flat-bet EV gain is only ~+0.05% per unit** — real but tiny.
+
+That tiny number is the point. Playing deviations barely move flat-bet EV
+because their value is **bet-weighted**: they matter only on the high-count
+hands where you are *also* betting big. It reinforces the whole project's
+thesis — **betting is where card counting's money is**, and the playing
+deviations are a small garnish on top.
+
 ## Tests
 
 ```bash

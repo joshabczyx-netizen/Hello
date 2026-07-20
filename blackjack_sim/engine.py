@@ -201,8 +201,14 @@ def _play_player_hand(
     up: int,
     splits_done: int,
     from_split_ace: bool,
+    play_override=None,
+    tc: float = 0.0,
 ) -> List[Tuple[List[str], float, bool]]:
-    """Play one player hand to completion, returning (cards, bet, busted)."""
+    """Play one player hand to completion, returning (cards, bet, busted).
+
+    ``play_override(cards, up, tc)`` may return an action to force (used for
+    count-based deviations); returning None falls back to basic strategy.
+    """
     # Split aces receive exactly one card and cannot act further.
     if from_split_ace:
         return [(cards, bet, hand_total(cards)[0] > 21)]
@@ -214,7 +220,11 @@ def _play_player_hand(
 
         can_double = len(cards) == 2
         can_split = len(cards) == 2 and splits_done < 3
-        action = basic_strategy(cards, up, can_double, can_split)
+        action = None
+        if play_override is not None:
+            action = play_override(cards, up, tc)
+        if action is None:
+            action = basic_strategy(cards, up, can_double, can_split)
 
         if action == "S":
             return [(cards, bet, False)]
@@ -229,17 +239,21 @@ def _play_player_hand(
             h1 = [cards[0], shoe.draw()]
             h2 = [cards[1], shoe.draw()]
             out: List[Tuple[List[str], float, bool]] = []
-            out += _play_player_hand(h1, bet, shoe, up, splits_done + 1, is_ace)
-            out += _play_player_hand(h2, bet, shoe, up, splits_done + 1, is_ace)
+            out += _play_player_hand(h1, bet, shoe, up, splits_done + 1, is_ace,
+                                     play_override, tc)
+            out += _play_player_hand(h2, bet, shoe, up, splits_done + 1, is_ace,
+                                     play_override, tc)
             return out
 
 
-def play_round(shoe: Shoe, base_bet: float) -> float:
+def play_round(shoe: Shoe, base_bet: float, play_override=None) -> float:
     """Play one full round for a single player and return net profit.
 
     Profit is expressed in the same units as ``base_bet`` (so passing 1.0
     yields the profit *multiple* per unit staked). Blackjack pays 3:2.
+    ``play_override`` optionally supplies count-based playing deviations.
     """
+    tc = shoe.true_count()  # decision-time count for any deviations
     player = [shoe.draw(), shoe.draw()]
     dealer = [shoe.draw(), shoe.draw()]  # dealer[1] is the hole card
     up = _upcard_value(dealer[0])
@@ -253,7 +267,8 @@ def play_round(shoe: Shoe, base_bet: float) -> float:
     if player_bj:
         return 1.5 * base_bet
 
-    hands = _play_player_hand(player, base_bet, shoe, up, 0, False)
+    hands = _play_player_hand(player, base_bet, shoe, up, 0, False,
+                             play_override, tc)
 
     all_busted = all(busted for _, _, busted in hands)
     if not all_busted:

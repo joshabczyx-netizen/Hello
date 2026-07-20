@@ -26,3 +26,6 @@ bankrolls.csv
 .vscode/
 .idea/
 .DS_Store
+
+# Sweep chart output
+sweep.svg

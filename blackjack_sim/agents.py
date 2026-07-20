@@ -13,11 +13,13 @@ from .neural import BettingNet, features
 class Agent:
     """Base class: holds a bankroll and decides a bet from the shoe state."""
 
-    def __init__(self, name: str, bankroll: float) -> None:
+    def __init__(self, name: str, bankroll: float, play_override=None) -> None:
         self.name = name
         self.bankroll = bankroll
         self.start_bankroll = bankroll
         self.busted_at: Optional[int] = None  # round index of ruin, if any
+        # Optional count-based playing deviations; None => basic strategy.
+        self.play_override = play_override
 
     @property
     def alive(self) -> bool:
@@ -44,8 +46,9 @@ class CounterAgent(Agent):
         name: str,
         bankroll: float,
         max_units: float = 8.0,
+        play_override=None,
     ) -> None:
-        super().__init__(name, bankroll)
+        super().__init__(name, bankroll, play_override)
         self.max_units = max_units
 
     def bet(self, shoe: Shoe, table: Table) -> float:
@@ -56,8 +59,9 @@ class CounterAgent(Agent):
 class NeuralAgent(Agent):
     """Bets according to a trained :class:`BettingNet` policy."""
 
-    def __init__(self, name: str, bankroll: float, net: BettingNet) -> None:
-        super().__init__(name, bankroll)
+    def __init__(self, name: str, bankroll: float, net: BettingNet,
+                 play_override=None) -> None:
+        super().__init__(name, bankroll, play_override)
         self.net = net
 
     def bet(self, shoe: Shoe, table: Table) -> float:
